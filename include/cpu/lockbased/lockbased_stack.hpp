@@ -28,6 +28,7 @@ private:
 public:
   // Preallocates storage to reduce allocator noise during benchmarking
   Stack() { m_allNodes.reserve(defaultNodesSize); }
+  ~Stack() { deferredMemoryReclamation(); }
 
   Stack(const Stack &) = delete;
   Stack &operator=(const Stack &) = delete;
@@ -72,13 +73,13 @@ public:
     m_allNodes.clear();
   }
 
-  ~Stack() { deferredMemoryReclamation(); }
-
 private:
   Node *m_top = nullptr;
-  std::mutex m_topMutex = {};
+  
+  std::mutex m_topMutex;
+  
   // Track allocated nodes for deferred reclamation
-  std::vector<Node *> m_allNodes = {};
+  std::vector<Node *> m_allNodes;
 
   // Initial reservation size to reduce reallocations during benchmarks
   static constexpr size_t defaultNodesSize = 100000;
