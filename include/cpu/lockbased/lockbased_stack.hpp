@@ -75,9 +75,9 @@ public:
 
 private:
   Node *m_top = nullptr;
-  
+
   std::mutex m_topMutex;
-  
+
   // Track allocated nodes for deferred reclamation
   std::vector<Node *> m_allNodes;
 
