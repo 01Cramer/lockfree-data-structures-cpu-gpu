@@ -36,29 +36,41 @@ public:
   Queue &operator=(Queue &&) = delete;
 
   void enqueue(const T &value) {
-    const std::lock_guard<std::mutex> lock(m_queueMutex);
     Node *newNode = new Node(value);
-    if (m_head == nullptr) {
-      m_head = newNode;
-    } else {
-      m_tail->next = newNode;
-    }
-    m_tail = newNode;
 
-    m_allNodes.push_back(newNode);
+    {
+      const std::lock_guard<std::mutex> lock(m_queueMutex);
+      if (m_head == nullptr) {
+        m_head = newNode;
+      } else {
+        m_tail->next = newNode;
+      }
+      m_tail = newNode;
+    }
+
+    {
+      const std::lock_guard<std::mutex> lock(m_nodesMutex);
+      m_allNodes.push_back(newNode);
+    }
   }
 
   void enqueue(T &&value) {
-    const std::lock_guard<std::mutex> lock(m_queueMutex);
     Node *newNode = new Node(std::move(value));
-    if (m_head == nullptr) {
-      m_head = newNode;
-    } else {
-      m_tail->next = newNode;
-    }
-    m_tail = newNode;
 
-    m_allNodes.push_back(newNode);
+    {
+      const std::lock_guard<std::mutex> lock(m_queueMutex);
+      if (m_head == nullptr) {
+        m_head = newNode;
+      } else {
+        m_tail->next = newNode;
+      }
+      m_tail = newNode;
+    }
+
+    {
+      const std::lock_guard<std::mutex> lock(m_nodesMutex);
+      m_allNodes.push_back(newNode);
+    }
   }
 
   std::optional<T> dequeue() {
@@ -89,9 +101,10 @@ private:
   Node *m_tail = nullptr;
 
   std::mutex m_queueMutex;
-  
+
   // Track allocated nodes for deferred reclamation
   std::vector<Node *> m_allNodes;
+  std::mutex m_nodesMutex;
 
   // Initial reservation size to reduce reallocations during benchmarks
   static constexpr size_t defaultNodesSize = 100000;

@@ -58,32 +58,48 @@ public:
   List &operator=(List &&) = delete;
 
   bool insert(const T &key) {
-    const std::lock_guard<std::mutex> lock(m_listMutex);
-    auto [left, right] = search(key);
-    if (right != m_tail && right->key == key) {
-      return false;
+    Node *newNode = new Node(key);
+
+    {
+      const std::lock_guard<std::mutex> lock(m_listMutex);
+      auto [left, right] = search(key);
+      if (right != m_tail && right->key == key) {
+        delete newNode;
+        return false;
+      }
+
+      newNode->next = right;
+      left->next = newNode;
     }
 
-    Node *newNode = new Node(key);
-    newNode->next = right;
-    left->next = newNode;
+    {
+      const std::lock_guard<std::mutex> lock(m_nodesMutex);
+      m_allNodes.push_back(newNode);
+    }
 
-    m_allNodes.push_back(newNode);
     return true;
   }
 
   bool insert(T &&key) {
-    const std::lock_guard<std::mutex> lock(m_listMutex);
-    auto [left, right] = search(key);
-    if (right != m_tail && right->key == key) {
-      return false;
+    Node *newNode = new Node(std::move(key));
+
+    {
+      const std::lock_guard<std::mutex> lock(m_listMutex);
+      auto [left, right] = search(key);
+      if (right != m_tail && right->key == key) {
+        delete newNode;
+        return false;
+      }
+
+      newNode->next = right;
+      left->next = newNode;
     }
 
-    Node *newNode = new Node(std::move(key));
-    newNode->next = right;
-    left->next = newNode;
+    {
+      const std::lock_guard<std::mutex> lock(m_nodesMutex);
+      m_allNodes.push_back(newNode);
+    }
 
-    m_allNodes.push_back(newNode);
     return true;
   }
 
@@ -137,6 +153,7 @@ private:
 
   // Track allocated nodes for deferred reclamation
   std::vector<Node *> m_allNodes;
+  std::mutex m_nodesMutex;
 
   // Initial reservation size to reduce reallocations during benchmarks
   static constexpr size_t defaultNodesSize =

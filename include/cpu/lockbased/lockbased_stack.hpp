@@ -36,21 +36,33 @@ public:
   Stack &operator=(Stack &&) = delete;
 
   void push(const T &value) {
-    const std::lock_guard<std::mutex> lock(m_topMutex);
     Node *newNode = new Node(value);
-    newNode->next = m_top;
-    m_top = newNode;
 
-    m_allNodes.push_back(newNode);
+    {
+      const std::lock_guard<std::mutex> lock(m_topMutex);
+      newNode->next = m_top;
+      m_top = newNode;
+    }
+
+    {
+      const std::lock_guard<std::mutex> lock(m_nodesMutex);
+      m_allNodes.push_back(newNode);
+    }
   }
 
   void push(T &&value) {
-    const std::lock_guard<std::mutex> lock(m_topMutex);
     Node *newNode = new Node(std::move(value));
-    newNode->next = m_top;
-    m_top = newNode;
 
-    m_allNodes.push_back(newNode);
+    {
+      const std::lock_guard<std::mutex> lock(m_topMutex);
+      newNode->next = m_top;
+      m_top = newNode;
+    }
+
+    {
+      const std::lock_guard<std::mutex> lock(m_nodesMutex);
+      m_allNodes.push_back(newNode);
+    }
   }
 
   std::optional<T> pop() {
@@ -80,6 +92,7 @@ private:
 
   // Track allocated nodes for deferred reclamation
   std::vector<Node *> m_allNodes;
+  std::mutex m_nodesMutex;
 
   // Initial reservation size to reduce reallocations during benchmarks
   static constexpr size_t defaultNodesSize = 100000;
