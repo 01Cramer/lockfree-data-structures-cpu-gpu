@@ -11,6 +11,7 @@ set(PROJECT_TESTS_DIR ${CMAKE_SOURCE_DIR}/tests)
 set(CPU_HEADERS
     "${PROJECT_INCLUDE_DIR}/cpu/lockbased/lockbased_stack.hpp"
     "${PROJECT_INCLUDE_DIR}/cpu/lockbased/lockbased_queue.hpp"
+    "${PROJECT_INCLUDE_DIR}/cpu/lockbased/lockbased_list.hpp"
 )
 
 add_executable(CPU
