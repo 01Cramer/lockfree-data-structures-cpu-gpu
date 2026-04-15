@@ -12,6 +12,7 @@ set(CPU_HEADERS
     "${PROJECT_INCLUDE_DIR}/cpu/lockbased/lockbased_stack.hpp"
     "${PROJECT_INCLUDE_DIR}/cpu/lockbased/lockbased_queue.hpp"
     "${PROJECT_INCLUDE_DIR}/cpu/lockbased/lockbased_list.hpp"
+    "${PROJECT_INCLUDE_DIR}/cpu/lockfree/lockfree_stack.hpp"
 )
 
 add_executable(CPU
