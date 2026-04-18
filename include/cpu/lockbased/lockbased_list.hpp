@@ -28,7 +28,7 @@ private:
     Node(const T &key) : key(key) {}
     Node(T &&key) : key(std::move(key)) {}
 
-    T key = {};
+    T key;
     Node *next = nullptr;
   };
 
@@ -58,16 +58,16 @@ public:
   List &operator=(List &&) = delete;
 
   bool insert(const T &key) {
-    Node *newNode = new Node(key);
+    Node *newNode = nullptr;
 
     {
       const std::lock_guard<std::mutex> lock(m_listMutex);
       auto [left, right] = search(key);
       if (right != m_tail && right->key == key) {
-        delete newNode;
         return false;
       }
 
+      newNode = new Node(key);
       newNode->next = right;
       left->next = newNode;
     }
@@ -81,16 +81,16 @@ public:
   }
 
   bool insert(T &&key) {
-    Node *newNode = new Node(std::move(key));
+    Node *newNode = nullptr;
 
     {
       const std::lock_guard<std::mutex> lock(m_listMutex);
       auto [left, right] = search(key);
       if (right != m_tail && right->key == key) {
-        delete newNode;
         return false;
       }
 
+      newNode = new Node(std::move(key));
       newNode->next = right;
       left->next = newNode;
     }

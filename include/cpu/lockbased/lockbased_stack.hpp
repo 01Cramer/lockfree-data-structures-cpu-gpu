@@ -21,7 +21,7 @@ private:
     Node(const T &val) : value(val) {}
     Node(T &&val) : value(std::move(val)) {}
 
-    T value = {};
+    T value;
     Node *next = nullptr;
   };
 
