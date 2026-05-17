@@ -1,34 +1,34 @@
 #pragma once
 
+#include <cstddef>
 #include <mutex>
 #include <utility>
-#include <vector>
+
+#include "cpu/node_pool.hpp"
 
 namespace cpu {
 
 namespace lockbased {
 
-// Lock-based sorted linked-list implementing a set abstract data type,
-// structurally aligned with the List used in Timothy L. Harris paper
+// Lock-based sorted linked list implementing a set ADT, structurally
+// aligned with the list used in Timothy L. Harris's paper
 // "A Pragmatic Implementation of Non-Blocking Linked Lists".
-// Invariant:
-// head -> ... -> tail
-// List is strictly sorted
-// No duplicate keys
-// Sentinel nodes are not part of the logical set
-// Using a single mutex for synchronization.
-// The structure owns all allocated nodes and uses deferred memory reclamation.
-// Memory is not freed during execution to ensure consistency with lock-free
-// implementations, where safe reclamation is more complex.
-// This design isolates synchronization costs and enables fair benchmarking.
+//
+// Invariants:
+//   head -> ... -> tail  (head and tail are sentinels, not part of the set)
+//   strictly sorted by key
+//   no duplicate keys
+//
+// A single mutex serialises list operations. Nodes are drawn from a NodePool
+// outside the critical section; head and tail sentinels are non-pool members.
+// A duplicate insert() consumes one slice slot — size the pool accordingly
+// for duplicate-heavy workloads.
+// See node_pool.hpp for the memory-model rationale.
 
 template <typename T> class List {
 private:
   struct Node {
-    Node(const T &key) : key(key) {}
-    Node(T &&key) : key(std::move(key)) {}
-
-    T key;
+    T key{};
     Node *next = nullptr;
   };
 
@@ -38,19 +38,10 @@ private:
   };
 
 public:
-  List() {
-    m_head = new Node(T{});
-    m_tail = new Node(T{});
-    m_head->next = m_tail;
-
-    // Preallocates storage to reduce allocator noise during benchmarking
-    m_allNodes.reserve(defaultNodesSize);
-
-    m_allNodes.push_back(m_head);
-    m_allNodes.push_back(m_tail);
+  List(std::size_t nodesPerThread, std::size_t numThreads)
+      : m_pool(nodesPerThread, numThreads) {
+    m_headSentinel.next = &m_tailSentinel;
   }
-
-  ~List() { deferredMemoryReclamation(); }
 
   List(const List &) = delete;
   List &operator=(const List &) = delete;
@@ -58,48 +49,30 @@ public:
   List &operator=(List &&) = delete;
 
   bool insert(const T &key) {
-    Node *newNode = nullptr;
+    Node *newNode = m_pool.acquire();
+    newNode->key = key;
 
-    {
-      const std::lock_guard<std::mutex> lock(m_listMutex);
-      auto [left, right] = search(key);
-      if (right != m_tail && right->key == key) {
-        return false;
-      }
-
-      newNode = new Node(key);
-      newNode->next = right;
-      left->next = newNode;
+    const std::lock_guard<std::mutex> lock(m_listMutex);
+    auto [left, right] = search(key);
+    if (right != &m_tailSentinel && right->key == key) {
+      return false;
     }
-
-    {
-      const std::lock_guard<std::mutex> lock(m_nodesMutex);
-      m_allNodes.push_back(newNode);
-    }
-
+    newNode->next = right;
+    left->next = newNode;
     return true;
   }
 
   bool insert(T &&key) {
-    Node *newNode = nullptr;
+    Node *newNode = m_pool.acquire();
+    newNode->key = std::move(key);
 
-    {
-      const std::lock_guard<std::mutex> lock(m_listMutex);
-      auto [left, right] = search(key);
-      if (right != m_tail && right->key == key) {
-        return false;
-      }
-
-      newNode = new Node(std::move(key));
-      newNode->next = right;
-      left->next = newNode;
+    const std::lock_guard<std::mutex> lock(m_listMutex);
+    auto [left, right] = search(newNode->key);
+    if (right != &m_tailSentinel && right->key == newNode->key) {
+      return false;
     }
-
-    {
-      const std::lock_guard<std::mutex> lock(m_nodesMutex);
-      m_allNodes.push_back(newNode);
-    }
-
+    newNode->next = right;
+    left->next = newNode;
     return true;
   }
 
@@ -107,7 +80,7 @@ public:
     const std::lock_guard<std::mutex> lock(m_listMutex);
     auto [left, right] = search(key);
 
-    if (right == m_tail || right->key != key) {
+    if (right == &m_tailSentinel || right->key != key) {
       return false;
     }
 
@@ -120,24 +93,15 @@ public:
     const std::lock_guard<std::mutex> lock(m_listMutex);
     const auto result = search(key);
     const Node *right = result.right;
-    return right != m_tail && right->key == key;
-  }
-
-  // Deferred memory reclamation
-  // Frees all allocated nodes after concurrent execution completes
-  void deferredMemoryReclamation() {
-    for (const auto &node : m_allNodes) {
-      delete node;
-    }
-    m_allNodes.clear();
+    return right != &m_tailSentinel && right->key == key;
   }
 
 private:
   SearchResult search(const T &key) {
-    Node *left = m_head;
+    Node *left = &m_headSentinel;
     Node *right = left->next;
 
-    while (right != m_tail && right->key < key) {
+    while (right != &m_tailSentinel && right->key < key) {
       left = right;
       right = right->next;
     }
@@ -146,18 +110,10 @@ private:
   }
 
 private:
-  Node *m_head; // Sentinel node
-  Node *m_tail; // Sentinel node
-
+  NodePool<Node> m_pool;
+  Node m_headSentinel;
+  Node m_tailSentinel;
   std::mutex m_listMutex;
-
-  // Track allocated nodes for deferred reclamation
-  std::vector<Node *> m_allNodes;
-  std::mutex m_nodesMutex;
-
-  // Initial reservation size to reduce reallocations during benchmarks
-  static constexpr size_t defaultNodesSize =
-      100000 + 2; // + 2 for head and tail sentinels
 };
 
 } // namespace lockbased

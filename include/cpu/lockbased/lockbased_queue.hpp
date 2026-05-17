@@ -1,34 +1,31 @@
 #pragma once
 
+#include <cstddef>
 #include <mutex>
 #include <optional>
 #include <utility>
-#include <vector>
+
+#include "cpu/node_pool.hpp"
 
 namespace cpu {
 
 namespace lockbased {
 
-// Lock-based queue using a single mutex for synchronization.
-// The structure owns all allocated nodes and uses deferred memory reclamation.
-// Memory is not freed during execution to ensure consistency with lock-free
-// implementations, where safe reclamation is more complex.
-// This design isolates synchronization costs and enables fair benchmarking.
+// Lock-based FIFO queue guarded by a single mutex. Nodes are drawn from a
+// NodePool outside the critical section; the mutex protects only the
+// linked-list update.
+// See node_pool.hpp for the memory-model rationale.
 
 template <typename T> class Queue {
 private:
   struct Node {
-    Node(const T &val) : value(val) {}
-    Node(T &&val) : value(std::move(val)) {}
-
-    T value;
+    T value{};
     Node *next = nullptr;
   };
 
 public:
-  // Preallocates storage to reduce allocator noise during benchmarking
-  Queue() { m_allNodes.reserve(defaultNodesSize); }
-  ~Queue() { deferredMemoryReclamation(); }
+  Queue(std::size_t nodesPerThread, std::size_t numThreads)
+      : m_pool(nodesPerThread, numThreads) {}
 
   Queue(const Queue &) = delete;
   Queue &operator=(const Queue &) = delete;
@@ -36,41 +33,29 @@ public:
   Queue &operator=(Queue &&) = delete;
 
   void enqueue(const T &value) {
-    Node *newNode = new Node(value);
+    Node *newNode = m_pool.acquire();
+    newNode->value = value;
 
-    {
-      const std::lock_guard<std::mutex> lock(m_queueMutex);
-      if (m_head == nullptr) {
-        m_head = newNode;
-      } else {
-        m_tail->next = newNode;
-      }
-      m_tail = newNode;
+    const std::lock_guard<std::mutex> lock(m_queueMutex);
+    if (m_head == nullptr) {
+      m_head = newNode;
+    } else {
+      m_tail->next = newNode;
     }
-
-    {
-      const std::lock_guard<std::mutex> lock(m_nodesMutex);
-      m_allNodes.push_back(newNode);
-    }
+    m_tail = newNode;
   }
 
   void enqueue(T &&value) {
-    Node *newNode = new Node(std::move(value));
+    Node *newNode = m_pool.acquire();
+    newNode->value = std::move(value);
 
-    {
-      const std::lock_guard<std::mutex> lock(m_queueMutex);
-      if (m_head == nullptr) {
-        m_head = newNode;
-      } else {
-        m_tail->next = newNode;
-      }
-      m_tail = newNode;
+    const std::lock_guard<std::mutex> lock(m_queueMutex);
+    if (m_head == nullptr) {
+      m_head = newNode;
+    } else {
+      m_tail->next = newNode;
     }
-
-    {
-      const std::lock_guard<std::mutex> lock(m_nodesMutex);
-      m_allNodes.push_back(newNode);
-    }
+    m_tail = newNode;
   }
 
   std::optional<T> dequeue() {
@@ -87,27 +72,11 @@ public:
     return std::optional<T>(std::move(dequeuedNode->value));
   }
 
-  // Deferred memory reclamation
-  // Frees all allocated nodes after concurrent execution completes
-  void deferredMemoryReclamation() {
-    for (const auto &node : m_allNodes) {
-      delete node;
-    }
-    m_allNodes.clear();
-  }
-
 private:
+  NodePool<Node> m_pool;
   Node *m_head = nullptr;
   Node *m_tail = nullptr;
-
   std::mutex m_queueMutex;
-
-  // Track allocated nodes for deferred reclamation
-  std::vector<Node *> m_allNodes;
-  std::mutex m_nodesMutex;
-
-  // Initial reservation size to reduce reallocations during benchmarks
-  static constexpr size_t defaultNodesSize = 100000;
 };
 
 } // namespace lockbased

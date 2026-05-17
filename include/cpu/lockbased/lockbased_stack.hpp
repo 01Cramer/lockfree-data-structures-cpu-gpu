@@ -1,34 +1,31 @@
 #pragma once
 
+#include <cstddef>
 #include <mutex>
 #include <optional>
 #include <utility>
-#include <vector>
+
+#include "cpu/node_pool.hpp"
 
 namespace cpu {
 
 namespace lockbased {
 
-// Lock-based stack using a single mutex for synchronization.
-// The structure owns all allocated nodes and uses deferred memory reclamation.
-// Memory is not freed during execution to ensure consistency with lock-free
-// implementations, where safe reclamation is more complex.
-// This design isolates synchronization costs and enables fair benchmarking.
+// Lock-based stack guarded by a single mutex. Nodes are drawn from a
+// NodePool outside the critical section; the mutex protects only the
+// linked-list update.
+// See node_pool.hpp for the memory-model rationale.
 
 template <typename T> class Stack {
 private:
   struct Node {
-    Node(const T &val) : value(val) {}
-    Node(T &&val) : value(std::move(val)) {}
-
-    T value;
+    T value{};
     Node *next = nullptr;
   };
 
 public:
-  // Preallocates storage to reduce allocator noise during benchmarking
-  Stack() { m_allNodes.reserve(defaultNodesSize); }
-  ~Stack() { deferredMemoryReclamation(); }
+  Stack(std::size_t nodesPerThread, std::size_t numThreads)
+      : m_pool(nodesPerThread, numThreads) {}
 
   Stack(const Stack &) = delete;
   Stack &operator=(const Stack &) = delete;
@@ -36,33 +33,21 @@ public:
   Stack &operator=(Stack &&) = delete;
 
   void push(const T &value) {
-    Node *newNode = new Node(value);
+    Node *newNode = m_pool.acquire();
+    newNode->value = value;
 
-    {
-      const std::lock_guard<std::mutex> lock(m_topMutex);
-      newNode->next = m_top;
-      m_top = newNode;
-    }
-
-    {
-      const std::lock_guard<std::mutex> lock(m_nodesMutex);
-      m_allNodes.push_back(newNode);
-    }
+    const std::lock_guard<std::mutex> lock(m_topMutex);
+    newNode->next = m_top;
+    m_top = newNode;
   }
 
   void push(T &&value) {
-    Node *newNode = new Node(std::move(value));
+    Node *newNode = m_pool.acquire();
+    newNode->value = std::move(value);
 
-    {
-      const std::lock_guard<std::mutex> lock(m_topMutex);
-      newNode->next = m_top;
-      m_top = newNode;
-    }
-
-    {
-      const std::lock_guard<std::mutex> lock(m_nodesMutex);
-      m_allNodes.push_back(newNode);
-    }
+    const std::lock_guard<std::mutex> lock(m_topMutex);
+    newNode->next = m_top;
+    m_top = newNode;
   }
 
   std::optional<T> pop() {
@@ -76,26 +61,10 @@ public:
     return std::optional<T>(std::move(poppedNode->value));
   }
 
-  // Deferred memory reclamation
-  // Frees all allocated nodes after concurrent execution completes
-  void deferredMemoryReclamation() {
-    for (const auto &node : m_allNodes) {
-      delete node;
-    }
-    m_allNodes.clear();
-  }
-
 private:
+  NodePool<Node> m_pool;
   Node *m_top = nullptr;
-
   std::mutex m_topMutex;
-
-  // Track allocated nodes for deferred reclamation
-  std::vector<Node *> m_allNodes;
-  std::mutex m_nodesMutex;
-
-  // Initial reservation size to reduce reallocations during benchmarks
-  static constexpr size_t defaultNodesSize = 100000;
 };
 
 } // namespace lockbased
