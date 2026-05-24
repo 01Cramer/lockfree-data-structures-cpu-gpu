@@ -3,6 +3,7 @@
 
 #include "cpu/lockbased/lockbased_list.hpp"
 #include "cpu/lockbased/lockbased_queue.hpp"
+#include "cpu/lockbased/lockbased_queue_two_lock.hpp"
 #include "cpu/lockbased/lockbased_stack.hpp"
 #include "cpu/lockfree/lockfree_queue.hpp"
 #include "cpu/lockfree/lockfree_stack.hpp"
@@ -13,6 +14,7 @@ int main() {
 
   cpu::lockbased::Stack<int> lbStack(nodesPerThread, numThreads);
   cpu::lockbased::Queue<int> lbQueue(nodesPerThread, numThreads);
+  cpu::lockbased::QueueTwoLock<int> lbQueueTwoLock(nodesPerThread, numThreads);
   cpu::lockbased::List<int> lbList(nodesPerThread, numThreads);
   cpu::lockfree::Stack<int> lfStack(nodesPerThread, numThreads);
   cpu::lockfree::Queue<int> lfQueue(nodesPerThread, numThreads);
@@ -22,6 +24,9 @@ int main() {
 
   lbQueue.enqueue(1);
   (void)lbQueue.dequeue();
+
+  lbQueueTwoLock.enqueue(1);
+  (void)lbQueueTwoLock.dequeue();
 
   (void)lbList.insert(1);
   (void)lbList.contains(1);

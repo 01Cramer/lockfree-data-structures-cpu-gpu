@@ -11,9 +11,15 @@ namespace cpu {
 
 namespace lockbased {
 
-// Lock-based FIFO queue guarded by a single mutex. Nodes are drawn from a
-// NodePool outside the critical section; the mutex protects only the
+// Lock-based FIFO queue guarded by a single mutex. Nodes are drawn from
+// a NodePool outside the critical section; the mutex protects only the
 // linked-list update.
+//
+// A dummy sentinel (a non-pool Node member) keeps m_head and m_tail
+// non-nullable, so enqueue and dequeue never branch on emptiness. This
+// matches the structural shape of QueueTwoLock and lockfree::Queue,
+// isolating the locking strategy as the only meaningful difference
+// between the three queue variants.
 // See node_pool.hpp for the memory-model rationale.
 
 template <typename T> class Queue {
@@ -25,7 +31,9 @@ private:
 
 public:
   Queue(std::size_t nodesPerThread, std::size_t numThreads)
-      : m_pool(nodesPerThread, numThreads) {}
+      : m_pool(nodesPerThread, numThreads),
+        m_head(&m_dummy),
+        m_tail(&m_dummy) {}
 
   Queue(const Queue &) = delete;
   Queue &operator=(const Queue &) = delete;
@@ -37,11 +45,7 @@ public:
     newNode->value = value;
 
     const std::lock_guard<std::mutex> lock(m_queueMutex);
-    if (m_head == nullptr) {
-      m_head = newNode;
-    } else {
-      m_tail->next = newNode;
-    }
+    m_tail->next = newNode;
     m_tail = newNode;
   }
 
@@ -50,32 +54,26 @@ public:
     newNode->value = std::move(value);
 
     const std::lock_guard<std::mutex> lock(m_queueMutex);
-    if (m_head == nullptr) {
-      m_head = newNode;
-    } else {
-      m_tail->next = newNode;
-    }
+    m_tail->next = newNode;
     m_tail = newNode;
   }
 
   std::optional<T> dequeue() {
     const std::lock_guard<std::mutex> lock(m_queueMutex);
-    if (m_head == nullptr) {
+    Node *next = m_head->next;
+    if (next == nullptr) {
       return std::nullopt;
     }
-    Node *dequeuedNode = m_head;
-    m_head = dequeuedNode->next;
-    if (m_head == nullptr) {
-      m_tail = nullptr;
-    }
-
-    return std::optional<T>(std::move(dequeuedNode->value));
+    std::optional<T> result(std::move(next->value));
+    m_head = next;
+    return result;
   }
 
 private:
   NodePool<Node> m_pool;
-  Node *m_head = nullptr;
-  Node *m_tail = nullptr;
+  Node m_dummy;
+  Node *m_head;
+  Node *m_tail;
   std::mutex m_queueMutex;
 };
 

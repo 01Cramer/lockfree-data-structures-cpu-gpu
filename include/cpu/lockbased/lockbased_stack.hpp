@@ -14,6 +14,12 @@ namespace lockbased {
 // Lock-based stack guarded by a single mutex. Nodes are drawn from a
 // NodePool outside the critical section; the mutex protects only the
 // linked-list update.
+//
+// No fine-grained lock-based variant exists in this project: a stack
+// has a single synchronization point (the top) intrinsic to LIFO. The
+// elimination stack (Hendler/Shavit/Yerushalmi, 2004) reduces contention
+// via paired push/pop cancellation but is a separate algorithm, not a
+// different locking granularity.
 // See node_pool.hpp for the memory-model rationale.
 
 template <typename T> class Stack {
