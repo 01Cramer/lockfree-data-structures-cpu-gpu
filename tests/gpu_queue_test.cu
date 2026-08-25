@@ -1,8 +1,7 @@
 // Correctness tests for the three GPU queue variants.
 //
-// The oracles and the value encoding live in tests/support/queue_oracles.hpp
-// and are shared with gpu_cclq_test.cu; that header carries the argument for
-// why the CPU ones transfer unchanged.
+// The oracles and the value encoding live in tests/support/queue_oracles.hpp,
+// which carries the argument for why the CPU ones transfer unchanged.
 //
 // Three scenarios, in increasing strength:
 //
