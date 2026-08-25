@@ -217,15 +217,12 @@ if(ENABLE_CUDA)
 
   set(GPU_HEADERS
       "${PROJECT_INCLUDE_DIR}/gpu/shared/atomics.cuh"
-      "${PROJECT_INCLUDE_DIR}/gpu/shared/batch_pool.cuh"
       "${PROJECT_INCLUDE_DIR}/gpu/shared/cuda_error.cuh"
       "${PROJECT_INCLUDE_DIR}/gpu/shared/node_pool.cuh"
       "${PROJECT_INCLUDE_DIR}/gpu/shared/spinlock.cuh"
-      "${PROJECT_INCLUDE_DIR}/gpu/shared/warp_scan.cuh"
       "${PROJECT_INCLUDE_DIR}/gpu/spinlock/spinlock_queue.cuh"
       "${PROJECT_INCLUDE_DIR}/gpu/spinlock/spinlock_queue_two_lock.cuh"
       "${PROJECT_INCLUDE_DIR}/gpu/lockfree/lockfree_queue.cuh"
-      "${PROJECT_INCLUDE_DIR}/gpu/lockfree/cclq_queue.cuh"
   )
 
   set(GPU_TEST_SUPPORT
@@ -242,7 +239,7 @@ if(ENABLE_CUDA)
         $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
   endfunction()
 
-  foreach(gpu_test gpu_spinlock_progress_test gpu_queue_test gpu_cclq_test)
+  foreach(gpu_test gpu_spinlock_progress_test gpu_queue_test)
     add_executable(${gpu_test}
         ${PROJECT_TESTS_DIR}/${gpu_test}.cu
         ${GPU_TEST_SUPPORT}
@@ -256,16 +253,44 @@ if(ENABLE_CUDA)
   add_executable(gpu_bench_queue
       ${PROJECT_BENCHMARKS_DIR}/gpu_bench_queue.cu
       ${PROJECT_BENCHMARKS_DIR}/support/gpu_workload.cuh
+      ${PROJECT_BENCHMARKS_DIR}/support/gpu_energy.cuh
       ${GPU_HEADERS}
   )
   configure_gpu_target(gpu_bench_queue)
   target_include_directories(gpu_bench_queue
       PRIVATE ${PROJECT_BENCHMARKS_DIR})
 
+  # --- Energy (NVML) ---
+  #
+  # On by default, unlike the CPU side's ENABLE_RAPL. There the energy build was
+  # a separate binary because reading RAPL needs a readable sysfs path that the
+  # development machine does not have; NVML ships with the driver that is
+  # already required to run any of this, so there is no configuration where the
+  # GPU targets build but NVML plausibly does not.
+  #
+  # Not fatal when missing, also unlike ENABLE_RAPL: a throughput-only run is
+  # still a useful run, and the binary reports on stderr which mode it opened
+  # in. Every energy column is then empty rather than zero, so a run without a
+  # meter cannot be mistaken for a run that measured no energy.
+  option(ENABLE_NVML "Measure GPU energy with NVML" ON)
+
+  if(ENABLE_NVML)
+    find_package(CUDAToolkit QUIET)
+    if(TARGET CUDA::nvml)
+      target_compile_definitions(gpu_bench_queue PRIVATE GPU_ENABLE_NVML)
+      target_link_libraries(gpu_bench_queue PRIVATE CUDA::nvml)
+      message(STATUS "NVML energy measurement: enabled")
+    else()
+      message(WARNING
+          "ENABLE_NVML is ON but the CUDA::nvml target was not found. Building "
+          "without energy measurement; throughput is unaffected. On Linux the "
+          "library is libnvidia-ml.so from the driver package.")
+    endif()
+  endif()
+
   # Ordered deliberately: the spinlock progress test is the precondition for
   # the lock-based queues, so if it fails there is no point reading the queue
   # results.
   add_test(NAME gpu_spinlock_progress COMMAND gpu_spinlock_progress_test)
   add_test(NAME gpu_queue COMMAND gpu_queue_test)
-  add_test(NAME gpu_cclq COMMAND gpu_cclq_test)
 endif()
