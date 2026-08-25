@@ -72,12 +72,10 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
-
-// nanosleep is POSIX, not standard C, so <time.h> rather than <ctime>: the
-// latter is only required to declare the standard subset.
-#include <time.h>
+#include <thread>
 
 #include <cuda_runtime.h>
 
@@ -253,8 +251,7 @@ private:
       // Sleeping rather than spinning: the point is to leave the device alone
       // while sampling, and a busy host thread can keep it out of its lowest
       // power state.
-      struct timespec interval = {0, 50 * 1000 * 1000}; // 50 ms
-      nanosleep(&interval, nullptr);
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     m_idleWatts = taken > 0 ? total / static_cast<double>(taken) : 0.0;
   }

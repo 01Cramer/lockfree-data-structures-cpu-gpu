@@ -183,6 +183,25 @@ inline int runAll(int argc, char **argv) {
     }
   }
 
+  if (c.warps < 2) {
+    c.warps = 2;
+  }
+  if (c.warps % 2 != 0) {
+    ++c.warps;
+  }
+  if (c.opsPerThread < 1) {
+    c.opsPerThread = 1;
+  }
+  if (c.activeLanes < 1) {
+    c.activeLanes = 1;
+  }
+  if (c.activeLanes > 32) {
+    c.activeLanes = 32;
+  }
+  if (c.prefill < 0) {
+    c.prefill = 0;
+  }
+
   requireVoltaOrNewer();
   std::printf("gpu config: warps=%d ops=%d lanes=%d prefill=%d\n", c.warps,
               c.opsPerThread, c.activeLanes, c.prefill);

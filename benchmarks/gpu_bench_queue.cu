@@ -131,6 +131,12 @@ void usage() {
       "env GPU_BENCH_MAX_POOL_MB overrides the pool memory budget.\n");
 }
 
+void failUsage(const char *message) {
+  std::fprintf(stderr, "%s\n", message);
+  usage();
+  std::exit(2);
+}
+
 Options parse(int argc, char **argv) {
   Options options;
   for (int i = 1; i < argc; ++i) {
@@ -175,6 +181,9 @@ void requireVoltaOrNewer() {
   GPU_CUDA_CHECK(cudaGetDevice(&device));
   cudaDeviceProp properties{};
   GPU_CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+  int clockRateKHz = 0;
+  GPU_CUDA_CHECK(
+      cudaDeviceGetAttribute(&clockRateKHz, cudaDevAttrClockRate, device));
 
   std::fprintf(stderr,
                "device: %s, compute %d.%d, %d SMs, %.1f GB, "
@@ -183,7 +192,7 @@ void requireVoltaOrNewer() {
                properties.multiProcessorCount,
                static_cast<double>(properties.totalGlobalMem) / (1 << 30),
                properties.l2CacheSize / 1024,
-               static_cast<double>(properties.clockRate) / 1000.0);
+               static_cast<double>(clockRateKHz) / 1000.0);
 
   if (properties.major < 7) {
     std::fprintf(stderr,
@@ -274,9 +283,37 @@ int main(int argc, char **argv) {
   const EnergyMeter meter;
   std::fprintf(stderr, "energy: %s\n", meter.status());
 
+  if (options.variants.empty() || options.warps.empty() ||
+      options.lanes.empty() || options.work.empty()) {
+    failUsage("list-valued options must not be empty");
+  }
+  if (options.opsPerThread <= 0) {
+    failUsage("--ops must be positive");
+  }
+  if (options.prefill < 0) {
+    failUsage("--prefill must be non-negative");
+  }
+  if (options.reps < 0 || options.warmup < 0) {
+    failUsage("--reps and --warmup must be non-negative");
+  }
+  if (options.nodesPerThread < 0) {
+    failUsage("--nodes-per-thread must be non-negative");
+  }
+  if (options.maxTotalOps < 0) {
+    failUsage("--max-total-ops must be non-negative");
+  }
   if (options.blockDim % kWarpSize != 0 || options.blockDim <= 0) {
-    std::fprintf(stderr, "--block-dim must be a positive multiple of 32\n");
-    return 2;
+    failUsage("--block-dim must be a positive multiple of 32");
+  }
+  for (int lanes : options.lanes) {
+    if (lanes < 1 || lanes > kWarpSize) {
+      failUsage("--lanes values must be in the range 1..32");
+    }
+  }
+  for (int warps : options.warps) {
+    if (warps <= 0) {
+      failUsage("--warps values must be positive");
+    }
   }
   emitHeader();
 
