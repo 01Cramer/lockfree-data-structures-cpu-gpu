@@ -41,11 +41,9 @@
 
 #include <cuda_runtime.h>
 
-#include "gpu/lockfree/cclq_queue.cuh"
-#include "gpu/shared/batch_pool.cuh"
 #include "gpu/shared/cuda_error.cuh"
 #include "gpu/shared/node_pool.cuh"
-#include "gpu/shared/warp_scan.cuh"
+#include "support/gpu_energy.cuh"
 
 namespace gpubench {
 
@@ -76,6 +74,13 @@ struct Result {
   long long dequeueSuccess = 0;
   long long dequeueAttempts = 0;
   std::size_t poolBytes = 0;
+  // Board energy over the timed region. `energy.valid` is false when no meter
+  // was available or the counter went backwards; `energyWindowOk` says whether
+  // the window was long enough for the figure to mean anything. Both travel
+  // with the row rather than being checked here, so a questionable point is
+  // visible in the output instead of dropped.
+  EnergySample energy;
+  bool energyWindowOk = false;
 };
 
 // Kernel-side parameters, passed by value.
@@ -206,7 +211,8 @@ inline void participants(const Config &cfg, int &producers, int &consumers) {
 // One repetition, from a freshly built pool and a freshly initialized queue.
 // Fresh by necessity: nodes are never reclaimed, so a second repetition on the
 // same pool would start with the first one's allocations already spent.
-template <typename QueueT> Result runRepetition(const Config &cfg) {
+template <typename QueueT>
+Result runRepetition(const Config &cfg, const EnergyMeter &meter) {
   const int threads = totalThreads(cfg);
   const int blocks = blocksFor(cfg);
   const int nodesPerThread = nodesPerThreadFor(cfg);
@@ -255,11 +261,30 @@ template <typename QueueT> Result runRepetition(const Config &cfg) {
   GPU_CUDA_CHECK(cudaEventCreate(&start));
   GPU_CUDA_CHECK(cudaEventCreate(&stop));
 
+  // Safe to read here: the prefill kernel above was synchronized, so the device
+  // is idle and nothing between this read and the launch consumes energy the
+  // run should not be charged for.
+  const double joulesBefore = meter.joulesNow();
+
   GPU_CUDA_CHECK(cudaEventRecord(start));
   benchKernel<QueueT><<<blocks, cfg.blockDim>>>(
       queue.get(), pool.view(), params, successes.get(), sink.get());
   GPU_CUDA_CHECK(cudaEventRecord(stop));
+
+  // Sampled here, deliberately: the launch is asynchronous, so the kernel is
+  // still running at this point and this reads power under load. Only the
+  // power-sampling fallback uses it, and taking it after the synchronize below
+  // would read the device idling down instead -- which does not merely add
+  // noise, it biases that fallback low every time.
+  const double wattsDuring = meter.wattsNow();
+
   GPU_CUDA_CHECK_KERNEL();
+
+  // After the synchronize inside GPU_CUDA_CHECK_KERNEL, so the kernel has
+  // finished and all of its energy is in the counter. Reading before the
+  // synchronize is the mistake the ml.energy guidance calls out: the CPU races
+  // ahead of the GPU and the difference undercounts.
+  const double joulesAfter = meter.joulesNow();
 
   float milliseconds = 0.0f;
   GPU_CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
@@ -278,197 +303,9 @@ template <typename QueueT> Result runRepetition(const Config &cfg) {
   Result result;
   result.milliseconds = static_cast<double>(milliseconds);
   result.poolBytes = pool.bytes();
-  for (int t = 0; t < threads; ++t) {
-    const long long ok =
-        static_cast<long long>(hostSuccesses[static_cast<std::size_t>(t)]);
-    if ((t / kWarpSize) % 2 == 0) {
-      result.enqueueSuccess += ok;
-    } else {
-      result.dequeueSuccess += ok;
-    }
-  }
-
-  int producers = 0;
-  int consumers = 0;
-  participants(cfg, producers, consumers);
-  result.enqueueAttempts =
-      static_cast<long long>(producers) * cfg.opsPerThread;
-  result.dequeueAttempts =
-      static_cast<long long>(consumers) * cfg.opsPerThread;
-
-  return result;
-}
-
-// Variant 4 (CCLQ) needs its own kernel and its own pool. Its API is
-// warp-collective -- every lane must call enqueue or dequeue -- so the
-// activeLanes control cannot be a `return`; non-participation goes through the
-// `request` flag instead, and the retired lanes of variants 1-3 become assisting
-// lanes here. The activeLanes axis therefore means something different for this
-// variant and must be reported as such.
-//
-// Everything not forced to differ is held identical: same op mix on the same
-// warp-parity axis, same inter-op work, same prefill policy, same
-// successful-operations metric, same fresh pool per repetition, same CUDA-event
-// timing window.
-
-using CclqQueue = gpu::lockfree::BatchQueue<Key>;
-
-// Largest block this harness will launch. The warp's output store (the paper's
-// this_data_list) is one batch per warp in shared memory.
-inline constexpr int kMaxBlockThreads = 128;
-
-// Batch nodes a prefill of `count` items consumes: the prefill warp enqueues 32
-// at a time, and one collective call spends one node.
-inline int cclqPrefillNodes(int count) { return (count + 31) / 32 + 1; }
-
-// Templated on the payload so these definitions stay usable from more than one
-// translation unit.
-template <typename T>
-__global__ void cclqInitKernel(gpu::lockfree::BatchQueue<T> *queue,
-                               gpu::BatchPoolView<T> pool) {
-  queue->initialize(pool);
-}
-
-// One warp, untimed, through the real enqueue path. `done` and `batch` are
-// computed identically by every lane, so the loop stays warp-uniform.
-template <typename T>
-__global__ void cclqPrefillKernel(gpu::lockfree::BatchQueue<T> *queue,
-                                  gpu::BatchPoolView<T> pool, int count) {
-  const int lane = static_cast<int>(threadIdx.x);
-  gpu::BatchAllocator<T> allocator = gpu::prefillBatchAllocator(pool);
-
-  int done = 0;
-  while (done < count) {
-    const int remaining = count - done;
-    const int batch = remaining < 32 ? remaining : 32;
-    queue->enqueue(static_cast<T>(done + lane), lane < batch, allocator);
-    done += batch;
-  }
-}
-
-template <typename T>
-__global__ void cclqBenchKernel(gpu::lockfree::BatchQueue<T> *queue,
-                                gpu::BatchPoolView<T> pool, Params params,
-                                unsigned long long *successes,
-                                unsigned int *sink) {
-  __shared__ T blockStore[kMaxBlockThreads];
-  T *warpStore = blockStore + (threadIdx.x / kWarpSize) * gpu::kBatchCapacity;
-
-  const int threadId =
-      static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-  const int laneInWarp = static_cast<int>(threadIdx.x) % kWarpSize;
-  const int globalWarp = threadId / kWarpSize;
-  const bool isProducer = (globalWarp % 2) == 0;
-
-  // The activeLanes control. No early return, unlike benchKernel: a retired lane
-  // would make the full-mask shuffles and the __syncwarp() inside the queue
-  // undefined behaviour. Per warp, not per block, as everywhere else.
-  const bool request = laneInWarp < params.activeLanes;
-
-  gpu::BatchAllocator<T> allocator = gpu::warpBatchAllocator(pool, globalWarp);
-  unsigned long long succeeded = 0;
-  unsigned int state = 0x9e3779b9u ^ static_cast<unsigned int>(threadId);
-
-  for (int op = 0; op < params.opsPerThread; ++op) {
-    if (isProducer) {
-      if (queue->enqueue(static_cast<T>(op), request, allocator)) {
-        ++succeeded;
-      }
-    } else {
-      T value = 0;
-      if (queue->dequeue(value, request, warpStore)) {
-        ++succeeded;
-        state ^= static_cast<unsigned int>(value);
-      }
-    }
-    // Every lane, including the assisting ones, so the per-lane private work
-    // between two queue operations matches benchKernel.
-    state = interOpWork(params.interOpWork, state);
-  }
-
-  successes[threadId] = succeeded;
-  if (state == 0u) {
-    sink[threadId] = state;
-  }
-}
-
-// Batch nodes each warp may allocate: one per collective enqueue call.
-inline int cclqNodesPerWarp(const Config &cfg) {
-  return cfg.nodesPerThread > 0 ? cfg.nodesPerThread : cfg.opsPerThread;
-}
-
-inline Result runCclqRepetition(const Config &cfg) {
-  const int threads = totalThreads(cfg);
-  const int blocks = blocksFor(cfg);
-  const int nodesPerWarp = cclqNodesPerWarp(cfg);
-  const int prefillNodes = cclqPrefillNodes(cfg.prefill);
-
-  // data + startPos + endPos + nextPos, matching BatchPool's allocation.
-  const long long nodes =
-      1 + prefillNodes +
-      static_cast<long long>(nodesPerWarp) * static_cast<long long>(cfg.warps);
-  const std::size_t poolBytes =
-      static_cast<std::size_t>(nodes) *
-          (gpu::kBatchCapacity * sizeof(Key) + 2 * sizeof(int)) +
-      static_cast<std::size_t>(nodes + 2) * sizeof(int);
-  const std::size_t budget = poolBudgetBytes();
-  if (poolBytes > budget) {
-    std::fprintf(stderr,
-                 "gpu bench: cclq needs %zu MB of pool memory (%lld batch "
-                 "nodes x %d items), over the %zu MB budget. Lower --ops, "
-                 "lower --warps, or raise GPU_BENCH_MAX_POOL_MB.\n",
-                 poolBytes / (1024 * 1024), nodes, gpu::kBatchCapacity,
-                 budget / (1024 * 1024));
-    std::abort();
-  }
-
-  gpu::BatchPool<Key> pool(prefillNodes, nodesPerWarp, cfg.warps);
-  gpu::DeviceBuffer<CclqQueue> queue(1);
-  gpu::DeviceBuffer<unsigned long long> successes(
-      static_cast<std::size_t>(threads));
-  gpu::DeviceBuffer<unsigned int> sink(static_cast<std::size_t>(threads));
-  successes.zero();
-  sink.zero();
-
-  cclqInitKernel<Key><<<1, 1>>>(queue.get(), pool.view());
-  GPU_CUDA_CHECK_KERNEL();
-
-  cclqPrefillKernel<Key><<<1, kWarpSize>>>(queue.get(), pool.view(),
-                                           cfg.prefill);
-  GPU_CUDA_CHECK_KERNEL();
-  pool.failIfOverflowed("cclq prefill");
-
-  Params params;
-  params.opsPerThread = cfg.opsPerThread;
-  params.activeLanes = cfg.activeLanes;
-  params.interOpWork = cfg.interOpWork;
-
-  cudaEvent_t start = nullptr;
-  cudaEvent_t stop = nullptr;
-  GPU_CUDA_CHECK(cudaEventCreate(&start));
-  GPU_CUDA_CHECK(cudaEventCreate(&stop));
-
-  GPU_CUDA_CHECK(cudaEventRecord(start));
-  cclqBenchKernel<Key><<<blocks, cfg.blockDim>>>(
-      queue.get(), pool.view(), params, successes.get(), sink.get());
-  GPU_CUDA_CHECK(cudaEventRecord(stop));
-  GPU_CUDA_CHECK_KERNEL();
-
-  float milliseconds = 0.0f;
-  GPU_CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
-  GPU_CUDA_CHECK(cudaEventDestroy(start));
-  GPU_CUDA_CHECK(cudaEventDestroy(stop));
-
-  pool.failIfOverflowed("cclq timed region");
-
-  std::vector<unsigned long long> hostSuccesses(
-      static_cast<std::size_t>(threads));
-  successes.copyToHost(hostSuccesses.data(),
-                       static_cast<std::size_t>(threads));
-
-  Result result;
-  result.milliseconds = static_cast<double>(milliseconds);
-  result.poolBytes = pool.bytes();
+  const double seconds = result.milliseconds / 1000.0;
+  result.energy = meter.between(joulesBefore, joulesAfter, wattsDuring, seconds);
+  result.energyWindowOk = energyWindowOk(seconds);
   for (int t = 0; t < threads; ++t) {
     const long long ok =
         static_cast<long long>(hostSuccesses[static_cast<std::size_t>(t)]);
