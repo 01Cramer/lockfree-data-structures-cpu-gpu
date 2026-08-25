@@ -19,7 +19,19 @@ DIR="$1"
 [ -d "${DIR}" ] || DIR="${REPO_ROOT}/$1"
 [ -d "${DIR}" ] || die "no such directory: $1"
 
-need python3 "Install it, or copy the results directory to a machine that has it."
+# python3 on the server and on WSL, plain python under git bash on Windows,
+# where `python3` exists only as a Microsoft Store stub that prints an
+# advertisement and exits 9009. Resolved rather than assumed, because analysis
+# is the one step that deliberately runs away from the measurement host.
+PY=""
+for candidate in python3 python; do
+  if command -v "${candidate}" >/dev/null 2>&1 &&
+     "${candidate}" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+    PY="${candidate}"
+    break
+  fi
+done
+[ -n "${PY}" ] || die "no Python 3 on PATH. Install it, or copy the results directory to a machine that has it."
 
 shopt -s nullglob
 JSON=("${DIR}"/bench_*.json)
@@ -29,7 +41,7 @@ say "parsing ${#JSON[@]} file(s)"
 # --force so re-running after a fix overwrites rather than refusing. The guard
 # it disables is there to stop a benchmark dump being used as a destination,
 # and the destination here is one this script chose.
-python3 "${REPO_ROOT}/scripts/parse_results.py" "${JSON[@]}" \
+"${PY}" "${REPO_ROOT}/scripts/parse_results.py" "${JSON[@]}" \
         -o "${DIR}/tidy.csv" --force \
   || die "parse_results.py failed"
 ok "${DIR#"${REPO_ROOT}/"}/tidy.csv"
@@ -41,22 +53,38 @@ if [ -f "${DIR}/tidy_latency.csv" ]; then
   ok "${DIR#"${REPO_ROOT}/"}/tidy_latency.csv (latency pass)"
 fi
 
-say "plotting"
-python3 "${REPO_ROOT}/scripts/plot_results.py" "${DIR}/tidy.csv" \
+# Two plotters over the same table, because the sweep has two grids and a flat
+# directory cannot express both. plot_grid.py is the one to read from: it lays
+# the figures out as Main/<mix>/<Structure>/ and Supplementary/<layout>/<Structure>/,
+# which is how the results get cited. plot_results.py stays because its flat
+# per-structure overview is a faster way to see whether a run is sane at all.
+say "plotting (grid)"
+"${PY}" "${REPO_ROOT}/scripts/plot_grid.py" "${DIR}/tidy.csv" \
         -o "${DIR}/figures" \
-  || die "plot_results.py failed"
+  || die "plot_grid.py failed"
 ok "${DIR#"${REPO_ROOT}/"}/figures/"
+
+say "plotting (flat overview)"
+"${PY}" "${REPO_ROOT}/scripts/plot_results.py" "${DIR}/tidy.csv" \
+        -o "${DIR}/figures/Flat" \
+  || die "plot_results.py failed"
+ok "${DIR#"${REPO_ROOT}/"}/figures/Flat/"
 
 # Three columns decide whether the rest of the table can be believed, so they
 # are surfaced here rather than left for someone to remember to check.
 say "trust check"
-python3 - "${DIR}/tidy.csv" <<'PY'
+"${PY}" - "${DIR}/tidy.csv" <<'PY'
 import sys
 import pandas as pd
 
 frame = pd.read_csv(sys.argv[1])
 frame = frame[frame["run_type"] == "iteration"]
 print(f"  {len(frame)} iteration rows")
+
+# parse_results.py names this column run_name; `name` was never in the tidy
+# table. The mistake could only ever surface on a run that had something to
+# report, which is the one run where this check has to work.
+LABEL = "run_name" if "run_name" in frame.columns else None
 
 def flag(column, predicate, message):
     if column not in frame.columns:
@@ -65,10 +93,12 @@ def flag(column, predicate, message):
     bad = frame[predicate(frame[column])]
     if bad.empty:
         print(f"  {column:<22} clean")
-    else:
-        print(f"  {column:<22} {len(bad)} row(s) -- {message}")
-        for name in bad["name"].head(3):
-            print(f"      {name}")
+        return
+    share = 100.0 * len(bad) / len(frame)
+    print(f"  {column:<22} {len(bad)} row(s), {share:.2f}% -- {message}")
+    if LABEL:
+        for label in bad[LABEL].head(3):
+            print(f"      {label}")
 
 flag("perf_running_frac", lambda c: c < 1.0,
      "PMU time-sliced, hardware counts are low")
