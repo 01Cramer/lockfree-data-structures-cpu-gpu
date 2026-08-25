@@ -32,9 +32,11 @@
 #include "gpu/shared/cuda_error.cuh"
 #include "gpu/spinlock/spinlock_queue.cuh"
 #include "gpu/spinlock/spinlock_queue_two_lock.cuh"
+#include "support/gpu_energy.cuh"
 #include "support/gpu_workload.cuh"
 
 using gpubench::Config;
+using gpubench::EnergyMeter;
 using gpubench::Key;
 using gpubench::kWarpSize;
 using gpubench::Result;
@@ -45,23 +47,19 @@ using SpinlockQueue = gpu::spinlock::Queue<Key>;
 using SpinlockQueueTwoLock = gpu::spinlock::QueueTwoLock<Key>;
 using LockfreeQueue = gpu::lockfree::Queue<Key>;
 
-Result dispatch(const Config &cfg) {
+Result dispatch(const Config &cfg, const EnergyMeter &meter) {
   if (cfg.variant == "spinlock") {
-    return gpubench::runRepetition<SpinlockQueue>(cfg);
+    return gpubench::runRepetition<SpinlockQueue>(cfg, meter);
   }
   if (cfg.variant == "spinlock_two_lock") {
-    return gpubench::runRepetition<SpinlockQueueTwoLock>(cfg);
+    return gpubench::runRepetition<SpinlockQueueTwoLock>(cfg, meter);
   }
   if (cfg.variant == "lockfree") {
-    return gpubench::runRepetition<LockfreeQueue>(cfg);
-  }
-  // Own kernel: its API is warp-collective. See support/gpu_workload.cuh.
-  if (cfg.variant == "cclq") {
-    return gpubench::runCclqRepetition(cfg);
+    return gpubench::runRepetition<LockfreeQueue>(cfg, meter);
   }
   std::fprintf(stderr,
-               "unknown variant '%s' (expected spinlock, spinlock_two_lock, "
-               "lockfree or cclq)\n",
+               "unknown variant '%s' (expected spinlock, spinlock_two_lock "
+               "or lockfree)\n",
                cfg.variant.c_str());
   std::exit(2);
 }
@@ -95,7 +93,7 @@ std::vector<int> splitInts(const char *raw) {
 
 struct Options {
   std::vector<std::string> variants{"spinlock", "spinlock_two_lock",
-                                    "lockfree", "cclq"};
+                                    "lockfree"};
   // Starts at 2: the mix is carried on warp parity, so a single warp would be a
   // producer-only run measuring a different workload.
   std::vector<int> warps{2, 4, 8, 16, 32, 64, 128, 256};
@@ -118,7 +116,7 @@ void usage() {
   std::fprintf(
       stderr,
       "usage: gpu_bench_queue [options]   (CSV on stdout, log on stderr)\n"
-      "  --variant LIST      spinlock,spinlock_two_lock,lockfree,cclq\n"
+      "  --variant LIST      spinlock,spinlock_two_lock,lockfree\n"
       "  --warps LIST        total warps in the grid\n"
       "  --lanes LIST        active lanes per warp, 1..32\n"
       "  --work LIST         units of private work between operations\n"
@@ -202,10 +200,13 @@ void emitHeader() {
               "participating_threads,ops_per_thread,ops_capped,inter_op_work,"
               "prefill,rep,ms,enq_success,enq_attempts,deq_success,"
               "deq_attempts,ops_success,ops_attempts,ops_per_sec,"
-              "deq_fail_frac,pool_mb\n");
+              "deq_fail_frac,pool_mb,"
+              "energy_j,energy_ok,energy_window_ok,energy_from_counter,"
+              "power_w,idle_power_w,nj_per_op,marginal_nj_per_op\n");
 }
 
-void emitRow(const Config &cfg, int rep, const Result &result) {
+void emitRow(const Config &cfg, int rep, const Result &result,
+             const EnergyMeter &meter) {
   int producers = 0;
   int consumers = 0;
   gpubench::participants(cfg, producers, consumers);
@@ -228,8 +229,25 @@ void emitRow(const Config &cfg, int rep, const Result &result) {
                       static_cast<double>(result.dequeueAttempts)
           : 0.0;
 
+  // Energy per successful operation, total and with the board's idle draw
+  // removed. The marginal figure is the one to reason from: an idle GPU draws a
+  // large fraction of its loaded power, so total energy divided by operations
+  // is close to a restatement of throughput -- which is exactly what the CPU
+  // half of this study measured, at a correlation of 0.992.
+  const double nanoJoulesPerOp =
+      (result.energy.valid && success > 0)
+          ? result.energy.joules * 1e9 / static_cast<double>(success)
+          : 0.0;
+  const double marginalJoules =
+      result.energy.joules - meter.idleWatts() * seconds;
+  const double marginalNanoJoulesPerOp =
+      (result.energy.valid && success > 0 && marginalJoules > 0.0)
+          ? marginalJoules * 1e9 / static_cast<double>(success)
+          : 0.0;
+
   std::printf("%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.6f,%lld,%lld,%lld,%lld,"
-              "%lld,%lld,%.3f,%.6f,%.2f\n",
+              "%lld,%lld,%.3f,%.6f,%.2f,"
+              "%.6f,%d,%d,%d,%.3f,%.3f,%.3f,%.3f\n",
               cfg.variant.c_str(), cfg.warps, cfg.blockDim,
               gpubench::totalThreads(cfg), cfg.activeLanes,
               producers + consumers, cfg.opsPerThread, cfg.capped ? 1 : 0,
@@ -237,7 +255,11 @@ void emitRow(const Config &cfg, int rep, const Result &result) {
               result.enqueueSuccess, result.enqueueAttempts,
               result.dequeueSuccess, result.dequeueAttempts, success, attempts,
               opsPerSecond, dequeueFailFraction,
-              static_cast<double>(result.poolBytes) / (1024.0 * 1024.0));
+              static_cast<double>(result.poolBytes) / (1024.0 * 1024.0),
+              result.energy.joules, result.energy.valid ? 1 : 0,
+              result.energyWindowOk ? 1 : 0,
+              result.energy.fromCounter ? 1 : 0, result.energy.watts,
+              meter.idleWatts(), nanoJoulesPerOp, marginalNanoJoulesPerOp);
   std::fflush(stdout);
 }
 
@@ -247,19 +269,15 @@ int main(int argc, char **argv) {
   const Options options = parse(argc, argv);
   requireVoltaOrNewer();
 
+  // One meter for the whole sweep: NVML initialisation is not free, and the
+  // idle baseline is a property of the device rather than of a configuration.
+  const EnergyMeter meter;
+  std::fprintf(stderr, "energy: %s\n", meter.status());
+
   if (options.blockDim % kWarpSize != 0 || options.blockDim <= 0) {
     std::fprintf(stderr, "--block-dim must be a positive multiple of 32\n");
     return 2;
   }
-  // CCLQ's per-warp shared-memory output store is sized at compile time.
-  if (options.blockDim > gpubench::kMaxBlockThreads) {
-    std::fprintf(stderr,
-                 "--block-dim %d exceeds the %d this harness is built for; "
-                 "raise kMaxBlockThreads in support/gpu_workload.cuh.\n",
-                 options.blockDim, gpubench::kMaxBlockThreads);
-    return 2;
-  }
-
   emitHeader();
 
   for (const std::string &variant : options.variants) {
@@ -302,10 +320,10 @@ int main(int argc, char **argv) {
           }
 
           for (int rep = 0; rep < options.warmup; ++rep) {
-            (void)dispatch(cfg);
+            (void)dispatch(cfg, meter);
           }
           for (int rep = 0; rep < options.reps; ++rep) {
-            emitRow(cfg, rep, dispatch(cfg));
+            emitRow(cfg, rep, dispatch(cfg, meter), meter);
           }
 
           std::fprintf(stderr, "done %s warps=%d lanes=%d work=%d ops=%d%s\n",
