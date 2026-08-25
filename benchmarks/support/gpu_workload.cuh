@@ -247,6 +247,7 @@ Result runRepetition(const Config &cfg, const EnergyMeter &meter) {
 
   prefillKernel<QueueT><<<1, 1>>>(queue.get(), pool.view(), cfg.prefill);
   GPU_CUDA_CHECK_KERNEL();
+  pool.failIfCorrupted("prefill");
   pool.failIfOverflowed("prefill");
 
   Params params;
@@ -279,6 +280,7 @@ Result runRepetition(const Config &cfg, const EnergyMeter &meter) {
   const double wattsDuring = meter.wattsNow();
 
   GPU_CUDA_CHECK_KERNEL();
+  pool.failIfCorrupted("timed region");
 
   // After the synchronize inside GPU_CUDA_CHECK_KERNEL, so the kernel has
   // finished and all of its energy is in the counter. Reading before the

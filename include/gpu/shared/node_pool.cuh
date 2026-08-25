@@ -90,9 +90,13 @@ template <typename T> struct PoolView {
   int reserved;
   int nodesPerThread;
   int numThreads;
+  int totalNodes;
   // Sticky, set by the first thread to exhaust its slice. Read by the host
   // after the kernel; see NodePool::failIfOverflowed().
   int *overflow;
+  // Debug-only corruption witness. When a queue observes an invalid node index
+  // before dereferencing it, it records {flag, where, value, threadId}.
+  int *badIndex;
 };
 
 // A thread's private bump allocator. Constructed at the top of a kernel and
@@ -168,6 +172,8 @@ public:
     m_nodes.zero();
     m_overflow.allocate(1);
     m_overflow.zero();
+    m_badIndex.allocate(4);
+    m_badIndex.zero();
   }
 
   NodePool(const NodePool &) = delete;
@@ -179,7 +185,9 @@ public:
     v.reserved = m_reserved;
     v.nodesPerThread = m_nodesPerThread;
     v.numThreads = m_numThreads;
+    v.totalNodes = static_cast<int>(m_nodes.count());
     v.overflow = m_overflow.get();
+    v.badIndex = m_badIndex.get();
     return v;
   }
 
@@ -208,10 +216,27 @@ public:
     std::abort();
   }
 
+  void failIfCorrupted(const char *context) const {
+    int witness[4] = {};
+    m_badIndex.copyToHost(witness, 4);
+    if (witness[0] == 0) {
+      return;
+    }
+    std::fprintf(stderr,
+                 "gpu::NodePool: invalid node index observed during %s "
+                 "(where %d, value %d, threadId %d, totalNodes %zu). This "
+                 "indicates queue index corruption before the guarded "
+                 "dereference.\n",
+                 context, witness[1], witness[2], witness[3],
+                 m_nodes.count());
+    std::abort();
+  }
+
   // Reset the flag between runs that share one pool. Not used by the
   // benchmark, which builds a fresh pool per configuration, but the tests
   // reuse a pool across scenarios.
   void clearOverflow() { m_overflow.zero(); }
+  void clearCorruption() { m_badIndex.zero(); }
 
 private:
   // NodeIndex is a signed 32-bit int, so the array cannot exceed INT_MAX
@@ -230,6 +255,7 @@ private:
 
   DeviceBuffer<Node<T>> m_nodes;
   DeviceBuffer<int> m_overflow;
+  DeviceBuffer<int> m_badIndex;
   int m_reserved;
   int m_nodesPerThread;
   int m_numThreads;

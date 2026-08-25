@@ -20,12 +20,10 @@ namespace lockfree {
 //   omission the same way.
 //
 //   The linking CAS carries release. This is the ordering that publishes the
-//   node's payload, written by this thread immediately above, to whichever
-//   thread later acquires the link in dequeue(). It is the single fence the
-//   algorithm needs and the one that Zhang et al.'s published CCLQ code does
-//   not have anywhere -- their arrays are `volatile`, which changes code
-//   generation and orders nothing, so a consumer there can read a linked node
-//   before its value has landed.
+//   whole node -- its payload and its initialized null successor -- to whichever
+//   thread later acquires the link. Dequeuers need that before reading the
+//   payload; enqueuers need it too before helping the tail forward and then
+//   treating the linked node as a tail whose `next` field is initialized.
 //
 //   The tail-help branch is kept. When the observed tail already has a
 //   successor, this thread advances the tail on the lagging thread's behalf
@@ -44,6 +42,8 @@ template <typename T> class alignas(kDeviceCacheLineBytes) Queue {
 public:
   __device__ void initialize(const PoolView<T> &pool) {
     m_nodes = pool.nodes;
+    m_nodeCount = pool.totalNodes;
+    m_badIndex = pool.badIndex;
     nextRef(kSentinelIndex).store(kNullIndex, cuda::memory_order_relaxed);
     headRef().store(kSentinelIndex, cuda::memory_order_relaxed);
     tailRef().store(kSentinelIndex, cuda::memory_order_relaxed);
@@ -60,8 +60,19 @@ public:
     NodeIndex tail = kNullIndex;
 
     while (true) {
-      tail = tailRef().load(cuda::memory_order_relaxed);
-      const NodeIndex tailNext = nextRef(tail).load(cuda::memory_order_relaxed);
+      tail = tailRef().load(cuda::memory_order_acquire);
+      if (!validIndex(tail)) {
+        recordBadIndex(1, tail);
+        return false;
+      }
+      // Acquire pairs with the release CAS that linked `tailNext`, so if we
+      // help the tail forward to that node then its payload and null successor
+      // are visible before any later iteration reads nextRef(tailNext).
+      const NodeIndex tailNext = nextRef(tail).load(cuda::memory_order_acquire);
+      if (tailNext != kNullIndex && !validIndex(tailNext)) {
+        recordBadIndex(2, tailNext);
+        return false;
+      }
 
       // M&S's snapshot check: confirm the tail did not move between the two
       // reads above. Retained for faithfulness and because it discards a CAS
@@ -69,7 +80,7 @@ public:
       // it is not load-bearing for safety -- if tailNext is null then `tail`
       // is the last node whatever m_tail currently says, and linking there is
       // correct regardless.
-      if (tail != tailRef().load(cuda::memory_order_relaxed)) {
+      if (tail != tailRef().load(cuda::memory_order_acquire)) {
         continue;
       }
 
@@ -86,7 +97,7 @@ public:
         // before retrying our own; this is the helping step.
         NodeIndex expected = tail;
         tailRef().compare_exchange_strong(expected, tailNext,
-                                          cuda::memory_order_relaxed,
+                                          cuda::memory_order_release,
                                           cuda::memory_order_relaxed);
       }
     }
@@ -96,21 +107,29 @@ public:
     // and the queue is correct either way.
     NodeIndex expected = tail;
     tailRef().compare_exchange_strong(expected, newNode,
-                                      cuda::memory_order_relaxed,
+                                      cuda::memory_order_release,
                                       cuda::memory_order_relaxed);
     return true;
   }
 
   __device__ bool dequeue(T &out) {
     while (true) {
-      const NodeIndex head = headRef().load(cuda::memory_order_relaxed);
-      const NodeIndex tail = tailRef().load(cuda::memory_order_relaxed);
+      const NodeIndex head = headRef().load(cuda::memory_order_acquire);
+      const NodeIndex tail = tailRef().load(cuda::memory_order_acquire);
+      if (!validIndex(head)) {
+        recordBadIndex(3, head);
+        return false;
+      }
       // Acquire: pairs with the linking release in enqueue, so the payload
       // read below is the value the enqueuer stored and not whatever the pool
       // was initialized to.
       const NodeIndex headNext = nextRef(head).load(cuda::memory_order_acquire);
+      if (headNext != kNullIndex && !validIndex(headNext)) {
+        recordBadIndex(4, headNext);
+        return false;
+      }
 
-      if (head != headRef().load(cuda::memory_order_relaxed)) {
+      if (head != headRef().load(cuda::memory_order_acquire)) {
         continue;
       }
 
@@ -124,7 +143,7 @@ public:
         // Empty-looking only because the tail lags. Help it forward.
         NodeIndex expected = tail;
         tailRef().compare_exchange_strong(expected, headNext,
-                                          cuda::memory_order_relaxed,
+                                          cuda::memory_order_release,
                                           cuda::memory_order_relaxed);
       } else {
         // Read the payload BEFORE the CAS that claims the node. Several
@@ -137,7 +156,7 @@ public:
         const T value = m_nodes[headNext].value;
         NodeIndex expected = head;
         if (headRef().compare_exchange_strong(expected, headNext,
-                                              cuda::memory_order_relaxed,
+                                              cuda::memory_order_release,
                                               cuda::memory_order_relaxed)) {
           out = value;
           return true;
@@ -147,6 +166,25 @@ public:
   }
 
 private:
+  __device__ bool validIndex(NodeIndex node) const {
+    return node >= 0 && node < m_nodeCount;
+  }
+
+  __device__ void recordBadIndex(int where, NodeIndex value) {
+    if (m_badIndex == nullptr) {
+      return;
+    }
+    DeviceAtomicRef<int> flag(m_badIndex[0]);
+    int expected = 0;
+    if (flag.compare_exchange_strong(expected, 1, cuda::memory_order_relaxed,
+                                     cuda::memory_order_relaxed)) {
+      m_badIndex[1] = where;
+      m_badIndex[2] = value;
+      m_badIndex[3] =
+          static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    }
+  }
+
   __device__ DeviceAtomicRef<NodeIndex> nextRef(NodeIndex node) {
     return DeviceAtomicRef<NodeIndex>(m_nodes[node].next);
   }
@@ -160,6 +198,8 @@ private:
   }
 
   Node<T> *m_nodes;
+  int m_nodeCount;
+  int *m_badIndex;
 
   // Two independently contended words, one line each: enqueuers hammer m_tail
   // and dequeuers hammer m_head, and unlike the single-lock variant no thread
