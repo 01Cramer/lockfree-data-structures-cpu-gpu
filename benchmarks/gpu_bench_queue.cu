@@ -208,6 +208,18 @@ int main() {
   // One meter and one idle baseline for the whole sweep.
   const EnergyMeter meter;
   std::fprintf(stderr, "energy: %s\n", meter.status());
+  std::fprintf(stderr,
+               "sweep: variants=%zu mixes=%zu blocks=%zu block_dims=%zu "
+               "configs=%zu reps=%d ops_per_thread=%d\n",
+               sizeof(kVariants) / sizeof(kVariants[0]),
+               sizeof(kMixes) / sizeof(kMixes[0]),
+               sizeof(kBlocks) / sizeof(kBlocks[0]),
+               sizeof(kBlockDims) / sizeof(kBlockDims[0]),
+               (sizeof(kVariants) / sizeof(kVariants[0])) *
+                   (sizeof(kMixes) / sizeof(kMixes[0])) *
+                   (sizeof(kBlocks) / sizeof(kBlocks[0])) *
+                   (sizeof(kBlockDims) / sizeof(kBlockDims[0])),
+               kRepetitions, kOpsPerThread);
 
   emitHeader();
 
