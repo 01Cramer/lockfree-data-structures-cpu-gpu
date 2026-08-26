@@ -99,7 +99,8 @@ Shared readBack(const gpu::DeviceBuffer<Shared> &buffer) {
 }
 
 // Run one blocking-lock configuration under the watchdog.
-void runBlocking(int blocks, int opsPerThread, const char *label) {
+void runBlocking(int blocks, int blockDim, int opsPerThread,
+                 const char *label) {
   gpu::DeviceBuffer<Shared> shared(1);
 
   initShared<<<1, 1>>>(shared.get());
@@ -107,14 +108,14 @@ void runBlocking(int blocks, int opsPerThread, const char *label) {
 
   cudaStream_t stream = nullptr;
   GPU_CUDA_CHECK(cudaStreamCreate(&stream));
-  blockingLockKernel<<<blocks, kWarpSize, 0, stream>>>(shared.get(),
+  blockingLockKernel<<<blocks, blockDim, 0, stream>>>(shared.get(),
                                                        opsPerThread);
   GPU_CUDA_CHECK(cudaGetLastError());
   waitWithWatchdog(stream, kWatchdogSeconds, label);
   GPU_CUDA_CHECK(cudaStreamDestroy(stream));
 
   const Shared result = readBack(shared);
-  const int expected = blocks * kWarpSize * opsPerThread;
+  const int expected = blocks * blockDim * opsPerThread;
 
   // A short count is a lost update, which means two threads were inside the
   // critical section at once.
@@ -128,28 +129,30 @@ using namespace progresstest;
 
 // One warp, 32 lanes, one lock.
 GPU_TEST(spinlock_progress_single_warp) {
-  runBlocking(/*blocks=*/1, gpuConfig().opsPerThread,
+  runBlocking(/*blocks=*/1, /*blockDim=*/32, gpuConfig().opsPerThread,
               "single-warp spinlock progress (32 lanes, one lock)");
 }
 
-// Same lock, many warps.
-GPU_TEST(spinlock_progress_many_warps) {
-  runBlocking(gpuConfig().warps, gpuConfig().opsPerThread,
-              "multi-warp spinlock progress");
+// Same lock, many blocks.
+GPU_TEST(spinlock_progress_many_blocks) {
+  runBlocking(gpuConfig().blocks, gpuConfig().blockDim,
+              gpuConfig().opsPerThread, "multi-block spinlock progress");
 }
 
 // Wider mutual-exclusion check.
 GPU_TEST(spinlock_mutual_exclusion) {
-  runBlocking(gpuConfig().warps, gpuConfig().opsPerThread * 4,
+  runBlocking(gpuConfig().blocks, gpuConfig().blockDim,
+              gpuConfig().opsPerThread * 4,
               "spinlock mutual exclusion");
 }
 
 // Bounded acquisition should not give up under this workload.
 GPU_TEST(spinlock_bounded_acquisition) {
-  const int blocks = gpuConfig().warps;
+  const int blocks = gpuConfig().blocks;
+  const int blockDim = gpuConfig().blockDim;
   const int opsPerThread = gpuConfig().opsPerThread;
   // Loose enough that a give-up indicates starvation.
-  const int attemptBudget = blocks * kWarpSize * 4096;
+  const int attemptBudget = blocks * blockDim * 4096;
 
   gpu::DeviceBuffer<Shared> shared(1);
   initShared<<<1, 1>>>(shared.get());
@@ -157,7 +160,7 @@ GPU_TEST(spinlock_bounded_acquisition) {
 
   cudaStream_t stream = nullptr;
   GPU_CUDA_CHECK(cudaStreamCreate(&stream));
-  boundedLockKernel<<<blocks, kWarpSize, 0, stream>>>(
+  boundedLockKernel<<<blocks, blockDim, 0, stream>>>(
       shared.get(), opsPerThread, attemptBudget);
   GPU_CUDA_CHECK(cudaGetLastError());
   waitWithWatchdog(stream, kWatchdogSeconds, "bounded spinlock acquisition");
@@ -168,7 +171,7 @@ GPU_TEST(spinlock_bounded_acquisition) {
   CHECK_EQ(result.witnessFailures, 0);
   // Counts the acquisitions that happened, so it stays exact even if a
   // give-up is reported above.
-  CHECK_EQ(result.counter, blocks * kWarpSize * opsPerThread - result.giveUps);
+  CHECK_EQ(result.counter, blocks * blockDim * opsPerThread - result.giveUps);
 }
 
 int main(int argc, char **argv) { return gpu_test::runAll(argc, argv); }
