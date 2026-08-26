@@ -2,7 +2,6 @@
 // The whole sweep runs in one process and uses one CUDA context.
 
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -33,14 +32,9 @@ constexpr const char *kVariants[] = {"spinlock", "spinlock_two_lock",
 constexpr int kBlocks[] = {1, 2, 4, 8, 16, 32, 64, 128};
 constexpr int kBlockDims[] = {32, 64, 128, 256, 512};
 constexpr int kMixes[] = {50};
-constexpr int kOpsPerThread = 1000;
+constexpr int kOpsPerThread = 5000;
 constexpr int kRepetitions = 5;
 constexpr int kNodesPerThread = 0; // 0 = derive from the operation mix
-
-constexpr int kCalibrationStartOps = 100;
-constexpr int kCalibrationMaxOps = 10000000;
-constexpr double kCalibrationTargetMs = 120.0;
-constexpr double kCalibrationMinProbeMs = 10.0;
 
 struct Metrics {
   double milliseconds = 0.0;
@@ -88,12 +82,6 @@ void emitHeader() {
               "deq_fail_frac,pool_mb,"
               "energy_j,energy_ok,energy_window_ok,energy_from_counter,"
               "power_w,idle_power_w,nj_per_op,marginal_nj_per_op\n");
-}
-
-void emitCalibrationHeader() {
-  std::printf("variant,blocks,block_dim,threads,mix_pct,probe_ops_per_thread,"
-              "ms,energy_window_ok,ops_per_sec,pool_mb,"
-              "recommended_ops_per_thread\n");
 }
 
 Metrics makeMetrics(const Result &result, const EnergyMeter &meter) {
@@ -151,41 +139,6 @@ void emitRow(const Config &cfg, const char *stat, int rep, const Metrics &m) {
               m.opsPerSecond, m.dequeueFailFraction, m.poolMb, m.energyJoules,
               m.energyOk, m.energyWindowOk, m.energyFromCounter, m.powerWatts,
               m.idleWatts, m.nanoJoulesPerOp, m.marginalNanoJoulesPerOp);
-  std::fflush(stdout);
-}
-
-int recommendedOpsPerThread(int probeOps, double milliseconds) {
-  if (milliseconds <= 0.0) {
-    return kCalibrationMaxOps;
-  }
-  const double scaled =
-      std::ceil(static_cast<double>(probeOps) * kCalibrationTargetMs /
-                milliseconds);
-  if (scaled < 1.0) {
-    return 1;
-  }
-  if (scaled > static_cast<double>(kCalibrationMaxOps)) {
-    return kCalibrationMaxOps;
-  }
-  return static_cast<int>(scaled);
-}
-
-int nextCalibrationOps(int probeOps, double milliseconds) {
-  const int recommended = recommendedOpsPerThread(probeOps, milliseconds);
-  if (milliseconds >= kCalibrationMinProbeMs || probeOps >= recommended) {
-    return probeOps;
-  }
-  const int doubled = probeOps * 2;
-  return std::min(kCalibrationMaxOps, std::max(doubled, recommended));
-}
-
-void emitCalibrationRow(const Config &cfg, const Metrics &m,
-                        int recommendedOps) {
-  std::printf("%s,%d,%d,%lld,%d,%d,%.6f,%.0f,%.3f,%.2f,%d\n",
-              cfg.variant.c_str(), cfg.blocks, cfg.blockDim,
-              gpubench::totalThreads(cfg), cfg.mixPct, cfg.opsPerThread,
-              m.milliseconds, m.energyWindowOk, m.opsPerSecond, m.poolMb,
-              recommendedOps);
   std::fflush(stdout);
 }
 
@@ -247,57 +200,6 @@ Metrics aggregateMetrics(const std::vector<Metrics> &rows, bool useMedian) {
   return out;
 }
 
-bool calibrationModeEnabled() {
-  const char *raw = std::getenv("GPU_BENCH_CALIBRATE");
-  return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
-}
-
-void runCalibration(const EnergyMeter &meter) {
-  emitCalibrationHeader();
-
-  int globalRecommended = 1;
-  for (const char *variant : kVariants) {
-    for (int mix : kMixes) {
-      for (int blocks : kBlocks) {
-        for (int blockDim : kBlockDims) {
-          Config cfg;
-          cfg.variant = variant;
-          cfg.blocks = blocks;
-          cfg.blockDim = blockDim;
-          cfg.mixPct = mix;
-          cfg.nodesPerThread = kNodesPerThread;
-
-          int probeOps = kCalibrationStartOps;
-          while (true) {
-            cfg.opsPerThread = probeOps;
-            const Metrics metrics = makeMetrics(dispatch(cfg, meter), meter);
-            const int recommended =
-                recommendedOpsPerThread(probeOps, metrics.milliseconds);
-            emitCalibrationRow(cfg, metrics, recommended);
-            globalRecommended = std::max(globalRecommended, recommended);
-
-            const int nextProbe =
-                nextCalibrationOps(probeOps, metrics.milliseconds);
-            if (nextProbe == probeOps || metrics.milliseconds >=
-                                            kCalibrationMinProbeMs) {
-              break;
-            }
-            probeOps = nextProbe;
-          }
-
-          std::fprintf(stderr,
-                       "calibrated %s blocks=%d block_dim=%d mix=%d\n",
-                       variant, blocks, blockDim, mix);
-        }
-      }
-    }
-  }
-
-  std::fprintf(stderr,
-               "calibration max recommended ops_per_thread for %.0f ms: %d\n",
-               kCalibrationTargetMs, globalRecommended);
-}
-
 } // namespace
 
 int main() {
@@ -306,11 +208,6 @@ int main() {
   // One meter and one idle baseline for the whole sweep.
   const EnergyMeter meter;
   std::fprintf(stderr, "energy: %s\n", meter.status());
-
-  if (calibrationModeEnabled()) {
-    runCalibration(meter);
-    return 0;
-  }
 
   emitHeader();
 
