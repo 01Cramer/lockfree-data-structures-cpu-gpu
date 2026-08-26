@@ -31,15 +31,15 @@ using LockfreeQueue = gpu::lockfree::Queue<Key>;
 constexpr const char *kVariants[] = {"spinlock", "spinlock_two_lock",
                                      "lockfree"};
 constexpr int kBlocks[] = {1, 2, 4, 8, 16, 32, 64, 128};
-constexpr int kBlockDims[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
-constexpr int kMixes[] = {90, 50, 10};
+constexpr int kBlockDims[] = {32, 64, 128, 256, 512};
+constexpr int kMixes[] = {50};
 constexpr int kOpsPerThread = 1000;
 constexpr int kRepetitions = 5;
 constexpr int kNodesPerThread = 0; // 0 = derive from the operation mix
 
 constexpr int kCalibrationStartOps = 100;
 constexpr int kCalibrationMaxOps = 10000000;
-constexpr double kCalibrationTargetMs = 60.0;
+constexpr double kCalibrationTargetMs = 120.0;
 constexpr double kCalibrationMinProbeMs = 10.0;
 
 struct Metrics {
