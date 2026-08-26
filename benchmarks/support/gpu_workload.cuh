@@ -138,8 +138,8 @@ Result runRepetition(const Config &cfg, const EnergyMeter &meter) {
   if (prefill > std::numeric_limits<int>::max()) {
     std::fprintf(stderr,
                  "gpu bench: this configuration needs %lld prefill nodes, "
-                 "which exceeds the 32-bit device index range. Lower --ops or "
-                 "--blocks.\n",
+                 "which exceeds the 32-bit device index range. Lower "
+                 "kOpsPerThread, kBlocks, or kBlockDims.\n",
                  prefill);
     std::abort();
   }
@@ -154,7 +154,7 @@ Result runRepetition(const Config &cfg, const EnergyMeter &meter) {
     std::fprintf(stderr,
                  "gpu bench: this configuration needs %zu MB of pool memory "
                  "(%d nodes x %lld threads + %d prefill), over the %zu MB "
-                 "budget. Lower --ops, lower --blocks, or raise "
+                 "budget. Lower kOpsPerThread, kBlocks, or kBlockDims; or raise "
                  "GPU_BENCH_MAX_POOL_MB.\n",
                  poolBytes / (1024 * 1024), nodesPerThread, participating,
                  static_cast<int>(prefill), budget / (1024 * 1024));

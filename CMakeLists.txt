@@ -194,8 +194,9 @@ if(ENABLE_CUDA)
   # Volta is a hard floor, not a preference. Below compute 7.0 the threads of a
   # warp share a program counter, so a lane holding a spinlock cannot reach the
   # release while its peers spin: both lock-based variants deadlock
-  # unconditionally at activeLanes > 1. Building for a lower architecture would
-  # produce a binary that hangs rather than one that runs slowly, so it is
+  # unconditionally when multiple lanes in one warp contend. Building for a
+  # lower architecture would produce a binary that hangs rather than one that
+  # runs slowly, so it is
   # refused here as well as static_asserted in include/gpu/shared/gpu_atomics.cuh.
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 70)
@@ -228,6 +229,7 @@ if(ENABLE_CUDA)
   set(GPU_TEST_SUPPORT
       "${PROJECT_TESTS_DIR}/support/gpu_test_harness.cuh"
       "${PROJECT_TESTS_DIR}/support/gpu_queue_oracles.hpp"
+      "${PROJECT_BENCHMARKS_DIR}/support/gpu_queue_workload.cuh"
   )
 
   function(configure_gpu_target target)

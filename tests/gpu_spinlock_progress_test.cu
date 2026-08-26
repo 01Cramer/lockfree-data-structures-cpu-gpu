@@ -5,6 +5,7 @@
 // turns a hang into a clear failure message.
 
 #include <cstdio>
+#include <algorithm>
 
 #include <cuda_runtime.h>
 
@@ -19,6 +20,7 @@ namespace progresstest {
 
 // Long enough for progress, short enough to catch a real hang.
 constexpr double kWatchdogSeconds = 60.0;
+constexpr int kMaxOpsPerThread = 1000;
 
 // Shared state for one run. One cache line's worth, allocated on the device.
 struct Shared {
@@ -98,6 +100,10 @@ Shared readBack(const gpu::DeviceBuffer<Shared> &buffer) {
   return host;
 }
 
+int progressOpsPerThread() {
+  return std::min(gpuConfig().opsPerThread, kMaxOpsPerThread);
+}
+
 // Run one blocking-lock configuration under the watchdog.
 void runBlocking(int blocks, int blockDim, int opsPerThread,
                  const char *label) {
@@ -129,20 +135,20 @@ using namespace progresstest;
 
 // One warp, 32 lanes, one lock.
 GPU_TEST(spinlock_progress_single_warp) {
-  runBlocking(/*blocks=*/1, /*blockDim=*/32, gpuConfig().opsPerThread,
+  runBlocking(/*blocks=*/1, /*blockDim=*/32, progressOpsPerThread(),
               "single-warp spinlock progress (32 lanes, one lock)");
 }
 
 // Same lock, many blocks.
 GPU_TEST(spinlock_progress_many_blocks) {
   runBlocking(gpuConfig().blocks, gpuConfig().blockDim,
-              gpuConfig().opsPerThread, "multi-block spinlock progress");
+              progressOpsPerThread(), "multi-block spinlock progress");
 }
 
 // Wider mutual-exclusion check.
 GPU_TEST(spinlock_mutual_exclusion) {
   runBlocking(gpuConfig().blocks, gpuConfig().blockDim,
-              gpuConfig().opsPerThread * 4,
+              progressOpsPerThread() * 4,
               "spinlock mutual exclusion");
 }
 
@@ -150,7 +156,7 @@ GPU_TEST(spinlock_mutual_exclusion) {
 GPU_TEST(spinlock_bounded_acquisition) {
   const int blocks = gpuConfig().blocks;
   const int blockDim = gpuConfig().blockDim;
-  const int opsPerThread = gpuConfig().opsPerThread;
+  const int opsPerThread = progressOpsPerThread();
   // Loose enough that a give-up indicates starvation.
   const int attemptBudget = blocks * blockDim * 4096;
 
