@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <string_view>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -175,6 +176,7 @@ struct Registrar {
 // summary, and return non-zero if any CHECK failed.
 inline int runAll(int argc, char **argv) {
   Config &c = detail::mutableConfig();
+  const char *filter = nullptr;
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
       c.iterations = std::strtoul(argv[++i], nullptr, 10);
@@ -182,6 +184,8 @@ inline int runAll(int argc, char **argv) {
       c.threads = static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 10));
     } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
       c.seed = static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (std::strcmp(argv[i], "--filter") == 0 && i + 1 < argc) {
+      filter = argv[++i];
     }
   }
 
@@ -189,6 +193,10 @@ inline int runAll(int argc, char **argv) {
             << " seed=" << c.seed << (CPU_TEST_TSAN ? " [tsan]" : "") << "\n";
 
   for (const TestCase &test : detail::registry()) {
+    if (filter != nullptr &&
+        std::string_view(test.name).find(filter) == std::string_view::npos) {
+      continue;
+    }
     const long before = detail::failureCount().load(std::memory_order_relaxed);
     std::cout << "[ RUN  ] " << test.name << "\n";
     test.fn();

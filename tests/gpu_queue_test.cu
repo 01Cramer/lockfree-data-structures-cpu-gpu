@@ -1,32 +1,8 @@
 // Correctness tests for the three GPU queue variants.
 //
-// The oracles and the value encoding live in tests/support/queue_oracles.hpp,
-// which carries the argument for why the CPU ones transfer unchanged.
-//
-// Three scenarios, in increasing strength:
-//
-//   sequential  one thread, enqueue then dequeue. No concurrency at all. It
-//               exists to fail first: a bug here is in the algorithm's plain
-//               structure, and finding it under 512 concurrent threads is
-//               strictly harder.
-//   fill/drain  every thread enqueues its own range, then (after the kernel
-//               boundary, which is a grid-wide barrier) every thread drains.
-//               Separating the phases means dequeue never has to distinguish
-//               "empty" from "a producer has not got there yet", so the drain
-//               terminates without any cross-block spin -- which would require
-//               the whole grid to be resident and would deadlock at high block
-//               counts.
-//   mixed       the shape the benchmark actually runs: a pre-filled queue,
-//               producer warps and consumer warps live at the same time,
-//               warp-uniform operation assignment. Conservation is checked
-//               over (prefill + produced) against (consumed + what was left),
-//               so nothing has to be assumed about how many dequeues found
-//               work.
-//
-// Run these under compute-sanitizer as well as plain: --tool memcheck catches
-// a pool overrun (which does not fault -- it silently returns an index past
-// the slice), --tool racecheck catches a missing fence, --tool synccheck
-// catches warp-synchronization misuse.
+// Scenarios: sequential enqueue/dequeue, concurrent fill then drain, and the
+// mixed operation shape used by the benchmark. The oracles check item
+// conservation and per-producer FIFO order.
 
 #include <algorithm>
 #include <cstdio>
@@ -34,19 +10,18 @@
 
 #include <cuda_runtime.h>
 
-#include "gpu/lockfree/lockfree_queue.cuh"
-#include "gpu/shared/cuda_error.cuh"
-#include "gpu/shared/node_pool.cuh"
-#include "gpu/spinlock/spinlock_queue.cuh"
-#include "gpu/spinlock/spinlock_queue_two_lock.cuh"
+#include "gpu/lockfree/gpu_lockfree_queue.cuh"
+#include "gpu/shared/gpu_cuda_utils.cuh"
+#include "gpu/shared/gpu_node_pool.cuh"
+#include "gpu/spinlock/gpu_spinlock_queue.cuh"
+#include "gpu/spinlock/gpu_spinlock_queue_two_lock.cuh"
+#include "support/gpu_queue_workload.cuh"
 #include "support/gpu_test_harness.cuh"
-#include "support/queue_oracles.hpp"
+#include "support/gpu_queue_oracles.hpp"
 
 using namespace gpu_test;
 
-// A named namespace, not an anonymous one. __global__ functions with internal
-// linkage have been a moving target across nvcc versions, and there is nothing
-// to gain by finding out which side of it the local toolkit falls on.
+// Named namespace keeps kernel linkage simple across nvcc versions.
 namespace queuetest {
 
 using queue_oracle::checkConservation;
@@ -56,31 +31,11 @@ using queue_oracle::flatten;
 using queue_oracle::Key;
 using queue_oracle::makeKey;
 
-// A lane participates iff its index within the warp is below activeLanes. This
-// is the one line the whole experiment turns on, and it is tested here in the
-// same form the benchmark uses so the tests cover the configuration that gets
-// measured. Per warp, not per block: with blockDim > 32 a per-block test would
-// disable whole warps instead of lanes.
-__host__ __device__ inline bool laneParticipates(int threadId,
-                                                 int activeLanes) {
-  return (threadId % 32) < activeLanes;
-}
-
 // --- kernels -------------------------------------------------------------
 //
-// All of them take the queue by pointer into device memory. The queue objects
-// have no constructors: they are raw cudaMalloc'd storage set up by
-// initQueueKernel, which is what lets one flat object be shared by every
-// block.
+// Queues live in raw device memory and are initialized by a kernel.
 
-template <typename QueueT>
-__global__ void initQueueKernel(QueueT *queue, gpu::PoolView<Key> pool) {
-  queue->initialize(pool);
-}
-
-// Single-threaded, untimed, and deliberately through the real enqueue path:
-// the starting contents are then exactly what the algorithm produces, not a
-// hand-built chain that might differ from it.
+// Single-threaded prefill through the real enqueue path.
 template <typename QueueT>
 __global__ void prefillKernel(QueueT *queue, gpu::PoolView<Key> pool,
                               int count, int prefillProducer) {
@@ -92,25 +47,20 @@ __global__ void prefillKernel(QueueT *queue, gpu::PoolView<Key> pool,
 
 template <typename QueueT>
 __global__ void fillKernel(QueueT *queue, gpu::PoolView<Key> pool,
-                           int opsPerThread, int activeLanes) {
+                           int opsPerThread) {
   const int threadId = blockIdx.x * blockDim.x + threadIdx.x;
-  if (!laneParticipates(threadId, activeLanes)) {
-    return;
-  }
   gpu::NodeAllocator<Key> allocator = gpu::threadAllocator(pool, threadId);
   for (int op = 0; op < opsPerThread; ++op) {
     queue->enqueue(makeKey(threadId, op), allocator);
   }
 }
 
-// Bounded by `capacity` so the output slice cannot overrun; the host repeats
-// the kernel until a round drains nothing, which both bounds the memory and
-// keeps each thread's records in dequeue order.
+// Bounded drain; the host repeats until a round removes nothing.
 template <typename QueueT>
 __global__ void drainKernel(QueueT *queue, Key *out, int *counts, int capacity,
-                            int activeLanes) {
+                            int totalThreads) {
   const int threadId = blockIdx.x * blockDim.x + threadIdx.x;
-  if (!laneParticipates(threadId, activeLanes)) {
+  if (threadId >= totalThreads) {
     return;
   }
   int taken = 0;
@@ -122,28 +72,31 @@ __global__ void drainKernel(QueueT *queue, Key *out, int *counts, int capacity,
   counts[threadId] = taken;
 }
 
-// Warp-uniform operation assignment: a whole warp enqueues or a whole warp
-// dequeues, never a mix within one warp. Two reasons, both from the design.
-// It removes divergence between two different queue operations, which would
-// otherwise be confounded with the activeLanes effect being measured; and it
-// puts the operation mix on an axis (which warps) that is independent of the
-// lane axis.
+template <typename QueueT>
+__global__ void dequeueOneKernel(QueueT *queue, Key *out, int *success) {
+  Key value = 0;
+  if (queue->dequeue(value)) {
+    *out = value;
+    *success = 1;
+  } else {
+    *success = 0;
+  }
+}
+
 template <typename QueueT>
 __global__ void mixedKernel(QueueT *queue, gpu::PoolView<Key> pool,
-                            int opsPerThread, int activeLanes, Key *out,
-                            int *counts) {
+                            int opsPerThread, int enqueueOps,
+                            int dequeueOps, Key *out, int *counts) {
   const int threadId = blockIdx.x * blockDim.x + threadIdx.x;
-  if (!laneParticipates(threadId, activeLanes)) {
-    return;
-  }
-  const int warpId = threadId / 32;
-  const bool isProducer = (warpId % 2) == 0;
 
   gpu::NodeAllocator<Key> allocator = gpu::threadAllocator(pool, threadId);
+  gpubench::QueueWorkload workload(threadId, enqueueOps, dequeueOps);
+  int produced = 0;
   int taken = 0;
   for (int op = 0; op < opsPerThread; ++op) {
-    if (isProducer) {
-      queue->enqueue(makeKey(threadId, op), allocator);
+    if (workload.next() == gpubench::QueueOp::Enqueue) {
+      queue->enqueue(makeKey(threadId, produced), allocator);
+      ++produced;
     } else {
       Key value = 0;
       if (queue->dequeue(value)) {
@@ -155,15 +108,33 @@ __global__ void mixedKernel(QueueT *queue, gpu::PoolView<Key> pool,
   counts[threadId] = taken;
 }
 
+__global__ void workloadCountKernel(int enqueueOps, int dequeueOps,
+                                    int *observedEnqueues,
+                                    int *observedDequeues) {
+  const int threadId = blockIdx.x * blockDim.x + threadIdx.x;
+  gpubench::QueueWorkload workload(threadId, enqueueOps, dequeueOps);
+
+  int enqueues = 0;
+  int dequeues = 0;
+  for (int op = 0; op < enqueueOps + dequeueOps; ++op) {
+    if (workload.next() == gpubench::QueueOp::Enqueue) {
+      ++enqueues;
+    } else {
+      ++dequeues;
+    }
+  }
+
+  observedEnqueues[threadId] = enqueues;
+  observedDequeues[threadId] = dequeues;
+}
+
 // --- host-side scenario plumbing -----------------------------------------
 
-// Everything one run needs: a fresh pool and a fresh queue object. Built per
-// scenario rather than reset between them, so no scenario can inherit state
-// from the one before it.
+// Fresh pool and queue for one scenario.
 template <typename QueueT> struct Fixture {
   Fixture(int prefillCapacity, int nodesPerThread, int threads)
       : pool(prefillCapacity, nodesPerThread, threads), queue(1) {
-    initQueueKernel<QueueT><<<1, 1>>>(queue.get(), pool.view());
+    gpubench::initQueueKernel<QueueT><<<1, 1>>>(queue.get(), pool.view());
     GPU_CUDA_CHECK_KERNEL();
   }
 
@@ -171,12 +142,29 @@ template <typename QueueT> struct Fixture {
   gpu::DeviceBuffer<QueueT> queue;
 };
 
-// Repeat the bounded drain until a round finds nothing. Returns each thread's
-// records in the order that thread dequeued them.
+template <typename QueueT> bool dequeueOne(QueueT *queue, Key &value) {
+  gpu::DeviceBuffer<Key> out(1);
+  gpu::DeviceBuffer<int> success(1);
+  out.zero();
+  success.zero();
+
+  dequeueOneKernel<QueueT><<<1, 1>>>(queue, out.get(), success.get());
+  GPU_CUDA_CHECK_KERNEL();
+
+  int hostSuccess = 0;
+  success.copyToHost(&hostSuccess, 1);
+  if (hostSuccess == 0) {
+    return false;
+  }
+  out.copyToHost(&value, 1);
+  return true;
+}
+
+// Drain all remaining items while preserving each thread's observation order.
 template <typename QueueT>
 std::vector<std::vector<Key>> drainAll(QueueT *queue, int blocks,
-                                       int activeLanes, int capacity) {
-  const int threads = blocks * kWarpSize;
+                                       int blockDim, int capacity) {
+  const int threads = blocks * blockDim;
   const std::size_t slots = static_cast<std::size_t>(threads) *
                             static_cast<std::size_t>(capacity);
 
@@ -188,8 +176,8 @@ std::vector<std::vector<Key>> drainAll(QueueT *queue, int blocks,
 
   while (true) {
     counts.zero();
-    drainKernel<QueueT><<<blocks, kWarpSize>>>(queue, out.get(), counts.get(),
-                                               capacity, activeLanes);
+    drainKernel<QueueT><<<blocks, blockDim>>>(queue, out.get(), counts.get(),
+                                              capacity, threads);
     GPU_CUDA_CHECK_KERNEL();
     counts.copyToHost(hostCounts.data(), static_cast<std::size_t>(threads));
 
@@ -224,50 +212,79 @@ template <typename QueueT> void queueSequential() {
 
   Fixture<QueueT> fixture(/*prefillCapacity=*/kItems, /*nodesPerThread=*/0,
                           /*threads=*/1);
+
+  Key value = 0;
+  CHECK(!dequeueOne(fixture.queue.get(), value));
+
   prefillKernel<QueueT><<<1, 1>>>(fixture.queue.get(), fixture.pool.view(),
                                   kItems, /*prefillProducer=*/0);
   GPU_CUDA_CHECK_KERNEL();
   fixture.pool.failIfOverflowed("gpu queue sequential prefill");
 
   const std::vector<std::vector<Key>> records =
-      drainAll(fixture.queue.get(), /*blocks=*/1, /*activeLanes=*/1, kItems);
+      drainAll(fixture.queue.get(), /*blocks=*/1, /*blockDim=*/1, kItems);
 
-  // One producer, one consumer, no concurrency: the order is not merely
-  // per-producer monotonic, it is exactly the enqueue order. Checked directly
-  // rather than through the weaker oracles.
+  // No concurrency: check exact FIFO order directly.
   const std::vector<Key> observed = flatten(records);
   CHECK_EQ(observed.size(), static_cast<std::size_t>(kItems));
   for (std::size_t i = 0; i < observed.size(); ++i) {
     CHECK_EQ(observed[i], makeKey(0, static_cast<int>(i)));
   }
+
+  CHECK(!dequeueOne(fixture.queue.get(), value));
+}
+
+void queueWorkloadCountsExact() {
+  constexpr int kBlocks = 2;
+  constexpr int kBlockDim = 32;
+  constexpr int kThreads = kBlocks * kBlockDim;
+  constexpr int kEnqueueOps = 10000;
+  constexpr int kDequeueOps = 8000;
+
+  gpu::DeviceBuffer<int> observedEnqueues(kThreads);
+  gpu::DeviceBuffer<int> observedDequeues(kThreads);
+  observedEnqueues.zero();
+  observedDequeues.zero();
+
+  workloadCountKernel<<<kBlocks, kBlockDim>>>(
+      kEnqueueOps, kDequeueOps, observedEnqueues.get(),
+      observedDequeues.get());
+  GPU_CUDA_CHECK_KERNEL();
+
+  std::vector<int> hostEnqueues(kThreads);
+  std::vector<int> hostDequeues(kThreads);
+  observedEnqueues.copyToHost(hostEnqueues.data(), kThreads);
+  observedDequeues.copyToHost(hostDequeues.data(), kThreads);
+
+  for (int t = 0; t < kThreads; ++t) {
+    CHECK_EQ(hostEnqueues[static_cast<std::size_t>(t)], kEnqueueOps);
+    CHECK_EQ(hostDequeues[static_cast<std::size_t>(t)], kDequeueOps);
+  }
 }
 
 template <typename QueueT> void queueFillDrain() {
   const Config &cfg = gpuConfig();
-  const int blocks = cfg.warps;
-  const int threads = blocks * kWarpSize;
+  const int blocks = cfg.blocks;
+  const int blockDim = cfg.blockDim;
+  const int threads = static_cast<int>(gpubench::totalThreads(cfg));
   if (!encodingFits(threads, cfg.opsPerThread)) {
     return;
   }
 
   Fixture<QueueT> fixture(/*prefillCapacity=*/0, cfg.opsPerThread, threads);
 
-  fillKernel<QueueT><<<blocks, kWarpSize>>>(
-      fixture.queue.get(), fixture.pool.view(), cfg.opsPerThread,
-      cfg.activeLanes);
+  fillKernel<QueueT><<<blocks, blockDim>>>(
+      fixture.queue.get(), fixture.pool.view(), cfg.opsPerThread);
   GPU_CUDA_CHECK_KERNEL();
   fixture.pool.failIfOverflowed("gpu queue fill");
 
-  // Slack over the fair share, so a greedy thread does not force many rounds.
+  // Extra space reduces the number of drain rounds.
   const int capacity = cfg.opsPerThread * 8;
   const std::vector<std::vector<Key>> records =
-      drainAll(fixture.queue.get(), blocks, cfg.activeLanes, capacity);
+      drainAll(fixture.queue.get(), blocks, blockDim, capacity);
 
   std::vector<Key> expected;
   for (int t = 0; t < threads; ++t) {
-    if (!laneParticipates(t, cfg.activeLanes)) {
-      continue;
-    }
     for (int op = 0; op < cfg.opsPerThread; ++op) {
       expected.push_back(makeKey(t, op));
     }
@@ -279,21 +296,22 @@ template <typename QueueT> void queueFillDrain() {
 
 template <typename QueueT> void queueMixed() {
   const Config &cfg = gpuConfig();
-  const int blocks = cfg.warps;
-  const int threads = blocks * kWarpSize;
-  // Producers are the even warps; the prefill borrows the id one past the last
-  // real thread, so its items are just another producer to the oracles and
-  // their FIFO order is checked too.
+  const int blocks = cfg.blocks;
+  const int blockDim = cfg.blockDim;
+  const int threads = static_cast<int>(gpubench::totalThreads(cfg));
+  const int enqueueOps = gpubench::enqueueOpsPerThread(cfg);
+  const int dequeueOps = gpubench::dequeueOpsPerThread(cfg);
+  const int prefill = static_cast<int>(gpubench::prefillFor(cfg));
+  // Prefill uses a synthetic producer id so FIFO is checked for it too.
   const int prefillProducer = threads;
-  if (!encodingFits(threads + 1,
-                         std::max(cfg.opsPerThread, cfg.prefill))) {
+  if (!encodingFits(threads + 1, std::max(cfg.opsPerThread, prefill))) {
     return;
   }
 
-  Fixture<QueueT> fixture(cfg.prefill, cfg.opsPerThread, threads);
+  Fixture<QueueT> fixture(prefill, enqueueOps, threads);
 
   prefillKernel<QueueT><<<1, 1>>>(fixture.queue.get(), fixture.pool.view(),
-                                  cfg.prefill, prefillProducer);
+                                  prefill, prefillProducer);
   GPU_CUDA_CHECK_KERNEL();
   fixture.pool.failIfOverflowed("gpu queue prefill");
 
@@ -303,9 +321,9 @@ template <typename QueueT> void queueMixed() {
   gpu::DeviceBuffer<int> counts(static_cast<std::size_t>(threads));
   counts.zero();
 
-  mixedKernel<QueueT><<<blocks, kWarpSize>>>(
-      fixture.queue.get(), fixture.pool.view(), cfg.opsPerThread,
-      cfg.activeLanes, out.get(), counts.get());
+  mixedKernel<QueueT><<<blocks, blockDim>>>(
+      fixture.queue.get(), fixture.pool.view(), cfg.opsPerThread, enqueueOps,
+      dequeueOps, out.get(), counts.get());
   GPU_CUDA_CHECK_KERNEL();
   fixture.pool.failIfOverflowed("gpu queue mixed run");
 
@@ -324,34 +342,26 @@ template <typename QueueT> void queueMixed() {
                                                 hostOut.begin() + base + n);
   }
 
-  // Whatever the consumers did not take is still in the queue. Draining it
-  // afterwards is what makes conservation checkable without knowing in advance
-  // how many dequeues found work.
+  // Drain leftovers so conservation can be checked exactly.
   const std::vector<std::vector<Key>> leftover = drainAll(
-      fixture.queue.get(), blocks, cfg.activeLanes, cfg.opsPerThread * 8);
+      fixture.queue.get(), blocks, blockDim, cfg.opsPerThread * 8);
 
   std::vector<Key> observed = flatten(records);
   const std::vector<Key> tail = flatten(leftover);
   observed.insert(observed.end(), tail.begin(), tail.end());
 
   std::vector<Key> expected;
-  for (int i = 0; i < cfg.prefill; ++i) {
+  for (int i = 0; i < prefill; ++i) {
     expected.push_back(makeKey(prefillProducer, i));
   }
   for (int t = 0; t < threads; ++t) {
-    const bool isProducer = ((t / 32) % 2) == 0;
-    if (!isProducer || !laneParticipates(t, cfg.activeLanes)) {
-      continue;
-    }
-    for (int op = 0; op < cfg.opsPerThread; ++op) {
+    for (int op = 0; op < enqueueOps; ++op) {
       expected.push_back(makeKey(t, op));
     }
   }
 
   checkConservation(observed, expected);
-  // The concurrent phase and the leftover drain are separate observation
-  // sequences and are checked separately: the drain is not a continuation of
-  // any one consumer's view.
+  // Concurrent records and leftover-drain records are separate observations.
   checkPerProducerFifo(records, threads + 1);
   checkPerProducerFifo(leftover, threads + 1);
 }
@@ -363,6 +373,8 @@ using namespace queuetest;
 using SpinlockQueue = gpu::spinlock::Queue<Key>;
 using SpinlockQueueTwoLock = gpu::spinlock::QueueTwoLock<Key>;
 using LockfreeQueue = gpu::lockfree::Queue<Key>;
+
+GPU_TEST(queue_workload_counts_exact) { queueWorkloadCountsExact(); }
 
 GPU_TEST(queue_sequential_spinlock) { queueSequential<SpinlockQueue>(); }
 GPU_TEST(queue_sequential_spinlock_two_lock) {

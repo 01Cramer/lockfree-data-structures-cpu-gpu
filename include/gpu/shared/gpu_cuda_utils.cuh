@@ -1,17 +1,6 @@
-// Host-side CUDA plumbing shared by the tests and the benchmark harness:
-// a checked-call macro, a checked kernel-launch macro, and an owning device
-// allocation.
-//
-// The macros abort rather than propagate. A CUDA error in this project is
-// always a bug in the harness or an exhausted device, never a condition to
-// recover from, and a silently ignored cudaMalloc failure would produce a
-// complete-looking sweep of numbers measured on a null pointer.
-//
-// GPU_CUDA_CHECK_KERNEL exists separately because kernel launches do not
-// return an error code. Two calls are needed: cudaGetLastError() catches an
-// invalid launch configuration, and cudaDeviceSynchronize() catches a fault
-// raised while the kernel ran. Checking only the first is the usual way an
-// out-of-bounds write goes unnoticed until it corrupts an unrelated result.
+// Host-side CUDA utilities shared by the tests and the benchmark harness:
+// checked-call macros, checked kernel-launch synchronization, and an owning
+// device allocation.
 
 #pragma once
 
@@ -52,9 +41,51 @@ inline void cudaCheckImpl(cudaError_t status, const char *expr,
                                  "kernel execution", __FILE__, __LINE__);      \
   } while (0)
 
-// Owning device allocation. Deliberately not a general-purpose container: it
-// has exactly the operations the harness uses, so there is no copy-assignment
-// path that could silently share a device pointer between two owners.
+// Check once before running tests or benchmarks that can exercise spinlocks.
+inline void requireVoltaOrNewer(FILE *stream, bool detailedDeviceLine) {
+  int deviceCount = 0;
+  GPU_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+  if (deviceCount == 0) {
+    std::fprintf(stderr, "No CUDA device found.\n");
+    std::exit(1);
+  }
+
+  int device = 0;
+  GPU_CUDA_CHECK(cudaGetDevice(&device));
+  cudaDeviceProp properties{};
+  GPU_CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+
+  if (detailedDeviceLine) {
+    int clockRateKHz = 0;
+    GPU_CUDA_CHECK(
+        cudaDeviceGetAttribute(&clockRateKHz, cudaDevAttrClockRate, device));
+    std::fprintf(stream,
+                 "device: %s, compute %d.%d, %d SMs, %.1f GB, "
+                 "L2 %d KB, clock %.0f MHz\n",
+                 properties.name, properties.major, properties.minor,
+                 properties.multiProcessorCount,
+                 static_cast<double>(properties.totalGlobalMem) / (1 << 30),
+                 properties.l2CacheSize / 1024,
+                 static_cast<double>(clockRateKHz) / 1000.0);
+  } else {
+    std::fprintf(stream, "device: %s (compute %d.%d, %d SMs)\n",
+                 properties.name, properties.major, properties.minor,
+                 properties.multiProcessorCount);
+  }
+
+  if (properties.major < 7) {
+    std::fprintf(stderr,
+                 "This device is compute %d.%d. The lock-based variants need "
+                 "independent thread scheduling (compute 7.0, Volta): below "
+                 "that, the threads of a warp share a program counter and a "
+                 "lane holding a spinlock cannot reach the release while its "
+                 "peers spin. The kernels would deadlock, not run slowly.\n",
+                 properties.major, properties.minor);
+    std::exit(1);
+  }
+}
+
+// Small owning device allocation used by tests and benchmarks.
 template <typename T> class DeviceBuffer {
 public:
   DeviceBuffer() = default;

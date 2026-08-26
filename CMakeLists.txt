@@ -196,7 +196,7 @@ if(ENABLE_CUDA)
   # release while its peers spin: both lock-based variants deadlock
   # unconditionally at activeLanes > 1. Building for a lower architecture would
   # produce a binary that hangs rather than one that runs slowly, so it is
-  # refused here as well as static_asserted in include/gpu/shared/atomics.cuh.
+  # refused here as well as static_asserted in include/gpu/shared/gpu_atomics.cuh.
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 70)
     message(STATUS
@@ -216,18 +216,18 @@ if(ENABLE_CUDA)
   endforeach()
 
   set(GPU_HEADERS
-      "${PROJECT_INCLUDE_DIR}/gpu/shared/atomics.cuh"
-      "${PROJECT_INCLUDE_DIR}/gpu/shared/cuda_error.cuh"
-      "${PROJECT_INCLUDE_DIR}/gpu/shared/node_pool.cuh"
-      "${PROJECT_INCLUDE_DIR}/gpu/shared/spinlock.cuh"
-      "${PROJECT_INCLUDE_DIR}/gpu/spinlock/spinlock_queue.cuh"
-      "${PROJECT_INCLUDE_DIR}/gpu/spinlock/spinlock_queue_two_lock.cuh"
-      "${PROJECT_INCLUDE_DIR}/gpu/lockfree/lockfree_queue.cuh"
+      "${PROJECT_INCLUDE_DIR}/gpu/shared/gpu_atomics.cuh"
+      "${PROJECT_INCLUDE_DIR}/gpu/shared/gpu_cuda_utils.cuh"
+      "${PROJECT_INCLUDE_DIR}/gpu/shared/gpu_node_pool.cuh"
+      "${PROJECT_INCLUDE_DIR}/gpu/shared/gpu_spinlock.cuh"
+      "${PROJECT_INCLUDE_DIR}/gpu/spinlock/gpu_spinlock_queue.cuh"
+      "${PROJECT_INCLUDE_DIR}/gpu/spinlock/gpu_spinlock_queue_two_lock.cuh"
+      "${PROJECT_INCLUDE_DIR}/gpu/lockfree/gpu_lockfree_queue.cuh"
   )
 
   set(GPU_TEST_SUPPORT
       "${PROJECT_TESTS_DIR}/support/gpu_test_harness.cuh"
-      "${PROJECT_TESTS_DIR}/support/queue_oracles.hpp"
+      "${PROJECT_TESTS_DIR}/support/gpu_queue_oracles.hpp"
   )
 
   function(configure_gpu_target target)
@@ -247,11 +247,13 @@ if(ENABLE_CUDA)
         ${GPU_HEADERS}
     )
     configure_gpu_target(${gpu_test})
-    target_include_directories(${gpu_test} PRIVATE ${PROJECT_TESTS_DIR})
+    target_include_directories(${gpu_test}
+        PRIVATE ${PROJECT_TESTS_DIR} ${PROJECT_BENCHMARKS_DIR})
   endforeach()
 
   add_executable(gpu_bench_queue
       ${PROJECT_BENCHMARKS_DIR}/gpu_bench_queue.cu
+      ${PROJECT_BENCHMARKS_DIR}/support/gpu_queue_workload.cuh
       ${PROJECT_BENCHMARKS_DIR}/support/gpu_workload.cuh
       ${PROJECT_BENCHMARKS_DIR}/support/gpu_energy.cuh
       ${GPU_HEADERS}

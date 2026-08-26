@@ -1,4 +1,4 @@
-// The correctness suites do not vary layout -- they check semantics, and no
+// The correctness suites do not vary layout - they check semantics, and no
 // Layout cell changes those. So they name one cell here, once, instead of
 // repeating it at every instantiation.
 //

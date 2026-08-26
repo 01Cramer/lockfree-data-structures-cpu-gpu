@@ -1,31 +1,24 @@
 #pragma once
 
-#include "gpu/shared/atomics.cuh"
-#include "gpu/shared/node_pool.cuh"
-#include "gpu/shared/spinlock.cuh"
+#include "gpu/shared/gpu_atomics.cuh"
+#include "gpu/shared/gpu_node_pool.cuh"
+#include "gpu/shared/gpu_spinlock.cuh"
 
 namespace gpu {
 
 namespace spinlock {
 
-// Variant 2: Michael & Scott's two-lock FIFO queue (1996, §4), with the
-// mutexes replaced by gpu::Spinlock. The device port of
-// cpu/spinlock/spinlock_queue_two_lock.hpp.
+// FIFO queue with separate spinlocks for the head and tail.
+// The device port of cpu/spinlock/spinlock_queue_two_lock.hpp:
+// same structure, same sentinel, only the locks and node addressing differ.
 //
 // Separate head and tail locks let one enqueue and one dequeue proceed
-// concurrently, so the sentinel is doing real work here rather than just
-// removing a branch: it guarantees the two ends never refer to the same node
-// while the queue is non-empty, which is what makes the two critical sections
-// independent.
+// concurrently. The sentinel node keeps m_head and m_tail non-null and lets
+// the two ends move independently while the queue is non-empty.
 //
-// Memory ordering: this is the only place the two variants differ in more than
-// the number of lock words. `next` is written under the tail lock and read
-// under the head lock, and those two locks order nothing with respect to each
-// other, so the link is a release store paired with an acquire load. Without
-// it a dequeuer could observe the link before the payload the enqueuer wrote
-// just above it -- the same hole that Zhang et al.'s published CCLQ code has,
-// where the shared arrays are `volatile` and nothing is fenced at all.
-// `volatile` suppresses caching; it does not order.
+// Memory ordering: a node's 'next' is written while holding the tail lock and
+// read while holding the head lock. Those locks do not order each other, so
+// the link is written with release and read with acquire.
 template <typename T> class alignas(kDeviceCacheLineBytes) QueueTwoLock {
 public:
   __device__ void initialize(const PoolView<T> &pool) {
@@ -73,10 +66,8 @@ public:
 private:
   Node<T> *m_nodes;
 
-  // Two independent synchronization points, one per line. This is the whole
-  // point of the variant: putting them on the same line would serialize the
-  // two critical sections at the L2 and reproduce single-lock behaviour with
-  // twice the code.
+  // Independent synchronization points for the two ends. Each lock is aligned
+  // so its atomic traffic is not coupled to the other lock by layout.
   alignas(kDeviceCacheLineBytes) Spinlock m_headLock;
   NodeIndex m_head;
 

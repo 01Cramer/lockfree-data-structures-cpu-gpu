@@ -1,74 +1,13 @@
-// Device energy measurement, the GPU counterpart of benchmarks/support/energy_meter.hpp.
+// NVML energy measurement for the GPU benchmark.
 //
-// The CPU half reads an accumulating microjoule counter out of the powercap
-// sysfs (Intel RAPL). NVML exposes the same shape of instrument for the GPU:
-// nvmlDeviceGetTotalEnergyConsumption returns total millijoules consumed by the
-// board since the driver was last reloaded, and the energy of a run is the
-// difference across it. Same instrument shape, so the same three questions
-// apply and are answered the same way.
+// Preferred path: read the accumulated board-energy counter before and after
+// the timed kernel. Fallback path: sample instantaneous power and multiply by
+// the kernel time. The CSV records which path was used.
 //
-//   1. What does it cover? The whole board -- SMs, memory, fans, everything on
-//      the card -- not the kernel. There is no per-kernel or per-SM breakdown,
-//      so a figure derived from it is attributable to the benchmark only to the
-//      extent that nothing else was using the device. That is the same caveat
-//      the CPU package counter carries.
-//
-//   2. Does it advance fast enough to see the window? No, not always, and this
-//      is the trap. NVML's underlying sampling is on the order of tens of
-//      milliseconds; a kernel that runs for 5 ms may fall entirely between two
-//      updates and report zero energy, or land across one and report a whole
-//      sample's worth. Neither is a measurement. `windowOk()` below is the
-//      guard, and the fix is to raise --ops until the kernel window clears the
-//      threshold. It is recorded per row rather than enforced, so a short run
-//      is identifiable in the output instead of silently wrong.
-//
-//   3. How much of it is the algorithm? Not all of it. A powered-on idle GPU
-//      draws a substantial fraction of its loaded draw, exactly as the CPU
-//      package did (63 W of 94 W there). Total energy divided by operations
-//      would therefore rank the variants in nearly the order throughput already
-//      did and carry almost no independent information -- which is precisely
-//      what the CPU results showed, at a correlation of 0.992. So the idle draw
-//      is calibrated once at startup and reported, and the analysis subtracts
-//      it to get the marginal energy the work is responsible for.
-//
-// Availability. nvmlDeviceGetTotalEnergyConsumption needs Volta or newer and a
-// reasonably recent driver. Where it is missing the meter degrades to sampling
-// instantaneous power, which is worse -- it assumes the draw was constant over
-// the window -- but is better than dropping the column, and which one produced
-// a row is recorded in the output rather than inferred.
-//
-// Relation to the published guidance
-//
-// The three practices the ml.energy group recommends for GPU energy measurement
-// ("Measuring GPU Energy: Best Practices", ml.energy blog) are each satisfied
-// here, and it is worth naming them because the thesis should cite the
-// methodology rather than appear to have invented it:
-//
-//   1. Measure, do not estimate from TDP. Nothing here is derived from a spec
-//      sheet; every joule comes from the device.
-//
-//   2. Prefer the energy API over polling the power API. On Volta and later
-//      nvmlDeviceGetTotalEnergyConsumption gives an accumulated counter, so a
-//      region costs two reads and a subtraction with no polling thread -- and
-//      no polling thread means no core spinning at full utilisation, which
-//      would itself consume energy and perturb the host side of a measurement.
-//      The power path is the documented fallback for older hardware, and that
-//      is exactly what it is used for here.
-//
-//   3. Synchronise the CPU and the GPU before the closing read. A CUDA launch
-//      is asynchronous, so a reading taken when the host reaches the next
-//      statement undercounts whatever is still in flight. gpu_workload.cuh
-//      takes the closing read after cudaDeviceSynchronize, and takes the
-//      power-fallback sample before it, while the kernel is still running.
-//
-// Their reference implementation, ZeusMonitor, is a Python library. It is not
-// used here for one structural reason rather than any disagreement: this sweep
-// is a single C++ process holding one CUDA context for every configuration, so
-// that no point in a curve pays an initialisation cost its neighbours did not.
-// Driving the kernels from Python to reach the library would give that up, and
-// wrapping the whole binary in it would measure the entire sweep as one window
-// instead of one window per configuration -- which is the granularity the
-// results need.
+// Energy is board-level, not kernel-level. The benchmark therefore also records
+// an idle-power baseline so analysis can use marginal energy per operation.
+// Very short kernels are flagged because NVML counters update too coarsely for
+// sub-50 ms windows to be reliable.
 
 #pragma once
 
@@ -85,10 +24,7 @@
 
 namespace gpubench {
 
-// Below this the NVML counter has probably not updated inside the window, and
-// the reading is quantisation rather than measurement. Chosen an order of
-// magnitude above NVML's typical few-millisecond update so that a row which
-// passes is not marginal.
+// Minimum kernel window for trusting the energy counter.
 inline constexpr double kMinEnergyWindowSeconds = 0.050;
 
 // One reading pair, plus what is needed to judge whether it means anything.
@@ -129,13 +65,10 @@ public:
   EnergyMeter(const EnergyMeter &) = delete;
   EnergyMeter &operator=(const EnergyMeter &) = delete;
 
-  bool available() const { return m_available; }
-  bool hasCounter() const { return m_hasCounter; }
   double idleWatts() const { return m_idleWatts; }
   const char *status() const { return m_status; }
 
-  // Raw counter read, in joules. Meaningless on its own; take the difference
-  // across the region of interest.
+  // Raw accumulated counter read, in joules.
   double joulesNow() const {
     if (!m_hasCounter) {
       return 0.0;
@@ -159,8 +92,7 @@ public:
     return static_cast<double>(milliWatts) / 1000.0;
   }
 
-  // Energy over a window, given the two counter reads that bracket it and how
-  // long it lasted. Falls back to power x time where no counter exists.
+  // Energy over one timed window.
   EnergySample between(double joulesBefore, double joulesAfter,
                        double wattsDuring, double seconds) const {
     EnergySample sample;
@@ -169,10 +101,7 @@ public:
     }
     if (m_hasCounter) {
       const double delta = joulesAfter - joulesBefore;
-      // A decrease means the driver was reloaded mid-sweep, or the counter
-      // wrapped. Either way the difference is not the run's energy, so the row
-      // is marked invalid rather than corrected -- the same decision the CPU
-      // meter makes about a RAPL counter that goes backwards.
+      // Counter wrap/reload: mark the row invalid instead of guessing.
       if (delta < 0.0) {
         return sample;
       }
@@ -197,10 +126,7 @@ private:
     }
     m_initialized = true;
 
-    // Bound by PCI bus id rather than by index. NVML's enumeration order is not
-    // guaranteed to match CUDA's, so nvmlDeviceGetHandleByIndex(0) can bind to
-    // a different board than the one the kernels run on -- which would produce
-    // a plausible energy column measured from the wrong GPU.
+    // Bind NVML to the same physical GPU CUDA is using.
     int cudaDevice = 0;
     if (cudaGetDevice(&cudaDevice) != cudaSuccess) {
       std::snprintf(m_status, sizeof(m_status), "cudaGetDevice failed");
@@ -235,9 +161,7 @@ private:
                   m_idleWatts);
   }
 
-  // Mean draw with nothing running, so the analysis can charge the algorithm
-  // only for what it added. Sampled rather than read once: the figure drifts
-  // with board temperature and a single sample lands wherever it lands.
+  // Average idle draw, sampled once at startup.
   void calibrateIdle() {
     cudaDeviceSynchronize();
     double total = 0.0;
@@ -248,9 +172,7 @@ private:
         total += watts;
         ++taken;
       }
-      // Sleeping rather than spinning: the point is to leave the device alone
-      // while sampling, and a busy host thread can keep it out of its lowest
-      // power state.
+      // Sleep so the sampling loop itself does not keep the host busy.
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     m_idleWatts = taken > 0 ? total / static_cast<double>(taken) : 0.0;
@@ -268,17 +190,12 @@ private:
 
 #else // !GPU_ENABLE_NVML
 
-// Compiled out. Same shape, so nothing at the call sites is conditional; the
-// harness reports that energy was unavailable and every energy column is empty.
+// Same interface when NVML support is compiled out.
 class EnergyMeter {
 public:
-  // User-provided rather than `= default`: the harness declares the meter as a
-  // const object, and const default-initialization of a class with no members
-  // and no user-provided constructor is ill-formed.
+  // Required for const default-initialization of an empty class.
   EnergyMeter() {}
 
-  bool available() const { return false; }
-  bool hasCounter() const { return false; }
   double idleWatts() const { return 0.0; }
   const char *status() const {
     return "built without NVML (configure with -DENABLE_NVML=ON)";
@@ -292,8 +209,7 @@ public:
 
 #endif
 
-// Whether a window was long enough for the reading across it to be a
-// measurement rather than quantisation.
+// Whether the energy window was long enough to trust.
 inline bool energyWindowOk(double seconds) {
   return seconds >= kMinEnergyWindowSeconds;
 }

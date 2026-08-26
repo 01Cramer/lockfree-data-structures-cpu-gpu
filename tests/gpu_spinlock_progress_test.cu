@@ -1,57 +1,23 @@
-// The day-one test. Nothing else in the GPU phase should be built until this
-// passes on the target device.
+// Progress and mutual-exclusion tests for the GPU spinlock.
 //
-// Why it is separate from the queue tests
-//
-// Both lock-based variants rest on one assumption: that all 32 lanes of a warp
-// can contend for the same spinlock and the winner can reach unlock() while
-// its peers are still spinning. That is true only because Volta gave every
-// thread its own program counter. On earlier hardware it is false
-// unconditionally -- the warp shares a PC, the winner is stuck at the loop the
-// losers are executing, and the kernel hangs forever. Cederman, Chatterjee &
-// Tsigas ran one operating thread per block for exactly this reason, which is
-// also why the activeLanes axis this project sweeps did not exist for them.
-//
-// If the assumption fails, the entire lock-based half of the design changes.
-// That is worth learning on day one from a thirty-line kernel rather than on
-// day four from a queue that hangs and could be hanging for any of six
-// reasons.
-//
-// What is checked, in increasing strength
-//
-//   1. Progress, one warp.  32 lanes, one lock, the production lock(). The
-//      purest intra-warp case: if independent thread scheduling is not doing
-//      what it claims, this alone never returns. Wrapped in a watchdog so the
-//      failure prints a diagnosis instead of hanging the suite.
-//   2. Progress, many warps. Adds inter-warp and inter-SM contention on the
-//      same lock.
-//   3. Mutual exclusion.  A non-atomic read-modify-write inside the critical
-//      section (a lost update proves two holders), plus an ownership witness:
-//      each holder stamps its thread id, waits, and re-reads it. The counter
-//      alone can survive a broken lock by luck; the witness makes a second,
-//      independent way to catch it.
-//   4. Bounded acquisition. The same workload through tryLock() with an
-//      attempt budget, which separates "deadlocked" from "starving": a
-//      deadlock times out in 1-2, whereas a thread that is merely never
-//      winning shows up here as a give-up with everything else still healthy.
+// The lock-based queue variants rely on 32 lanes of one warp being able to
+// contend for one lock while the winner still reaches unlock(). The watchdog
+// turns a hang into a clear failure message.
 
 #include <cstdio>
 
 #include <cuda_runtime.h>
 
-#include "gpu/shared/cuda_error.cuh"
-#include "gpu/shared/spinlock.cuh"
+#include "gpu/shared/gpu_cuda_utils.cuh"
+#include "gpu/shared/gpu_spinlock.cuh"
 #include "support/gpu_test_harness.cuh"
 
 using namespace gpu_test;
 
-// A named namespace, not an anonymous one. __global__ functions with internal
-// linkage have been a moving target across nvcc versions, and there is nothing
-// to gain by finding out which side of it the local toolkit falls on.
+// Named namespace keeps kernel linkage simple across nvcc versions.
 namespace progresstest {
 
-// Generous relative to any plausible wait, tight enough that a genuine
-// deadlock is reported in under a minute.
+// Long enough for progress, short enough to catch a real hang.
 constexpr double kWatchdogSeconds = 60.0;
 
 // Shared state for one run. One cache line's worth, allocated on the device.
@@ -71,14 +37,7 @@ __global__ void initShared(Shared *shared) {
   shared->giveUps = 0;
 }
 
-// The critical section, shared by every kernel below so that all of them are
-// testing the same body and differ only in how the lock is taken.
-//
-// The counter is loaded and stored as two separate relaxed atomic accesses.
-// Relaxed, so the compiler cannot keep it in a register across iterations and
-// the test measures memory rather than a register; two accesses, so it is
-// still a read-modify-write that a second concurrent holder can lose. An
-// atomicAdd here would pass with no lock at all.
+// Shared critical section used by the blocking and bounded lock tests.
 __device__ inline void criticalSection(Shared *shared, int threadId) {
   gpu::DeviceAtomicRef<int> counter(shared->counter);
   counter.store(counter.load(cuda::memory_order_relaxed) + 1,
@@ -86,8 +45,7 @@ __device__ inline void criticalSection(Shared *shared, int threadId) {
 
   gpu::DeviceAtomicRef<int> owner(shared->witnessOwner);
   owner.store(threadId, cuda::memory_order_relaxed);
-  // Long enough that a second holder would have to be very lucky to slip in
-  // and out unseen; short enough not to dominate the run.
+  // Gives another accidental holder time to overwrite the witness.
   __nanosleep(64);
   if (owner.load(cuda::memory_order_relaxed) != threadId) {
     gpu::DeviceAtomicRef<int> failures(shared->witnessFailures);
@@ -95,7 +53,7 @@ __device__ inline void criticalSection(Shared *shared, int threadId) {
   }
 }
 
-// Kernels 1-3: the production lock, unbounded. A hang here is the finding.
+// Production lock path.
 __global__ void blockingLockKernel(Shared *shared, int opsPerThread) {
   const int threadId = blockIdx.x * blockDim.x + threadIdx.x;
   for (int op = 0; op < opsPerThread; ++op) {
@@ -105,7 +63,7 @@ __global__ void blockingLockKernel(Shared *shared, int opsPerThread) {
   }
 }
 
-// Kernel 4: bounded acquisition. Distinguishes starvation from deadlock.
+// Bounded tryLock path.
 __global__ void boundedLockKernel(Shared *shared, int opsPerThread,
                                   int attemptBudget) {
   const int threadId = blockIdx.x * blockDim.x + threadIdx.x;
@@ -140,8 +98,7 @@ Shared readBack(const gpu::DeviceBuffer<Shared> &buffer) {
   return host;
 }
 
-// Run one blocking-lock configuration under the watchdog and check every
-// invariant. `label` names the configuration in the timeout message.
+// Run one blocking-lock configuration under the watchdog.
 void runBlocking(int blocks, int opsPerThread, const char *label) {
   gpu::DeviceBuffer<Shared> shared(1);
 
@@ -169,36 +126,29 @@ void runBlocking(int blocks, int opsPerThread, const char *label) {
 
 using namespace progresstest;
 
-// 1. One warp, 32 lanes, one lock. The purest statement of the assumption the
-//    whole lock-based half depends on.
+// One warp, 32 lanes, one lock.
 GPU_TEST(spinlock_progress_single_warp) {
   runBlocking(/*blocks=*/1, gpuConfig().opsPerThread,
               "single-warp spinlock progress (32 lanes, one lock)");
 }
 
-// 2. Same lock, many warps across many SMs. Adds the inter-warp contention the
-//    literature measured, on top of the intra-warp contention it did not.
+// Same lock, many warps.
 GPU_TEST(spinlock_progress_many_warps) {
   runBlocking(gpuConfig().warps, gpuConfig().opsPerThread,
               "multi-warp spinlock progress");
 }
 
-// 3. Mutual exclusion at the widest configuration the test config asks for,
-//    with more operations per thread so the interleaving has room to go wrong.
+// Wider mutual-exclusion check.
 GPU_TEST(spinlock_mutual_exclusion) {
   runBlocking(gpuConfig().warps, gpuConfig().opsPerThread * 4,
               "spinlock mutual exclusion");
 }
 
-// 4. Bounded acquisition. Everything should still add up, and no thread should
-//    exhaust a budget this far above any fair wait; a give-up here with tests
-//    1-3 passing means the lock makes progress but starves someone, which is a
-//    finding about the backoff, not about the hardware.
+// Bounded acquisition should not give up under this workload.
 GPU_TEST(spinlock_bounded_acquisition) {
   const int blocks = gpuConfig().warps;
   const int opsPerThread = gpuConfig().opsPerThread;
-  // Contenders x a very loose per-contender allowance. Reaching this without
-  // acquiring is not a slow wait, it is not being served at all.
+  // Loose enough that a give-up indicates starvation.
   const int attemptBudget = blocks * kWarpSize * 4096;
 
   gpu::DeviceBuffer<Shared> shared(1);

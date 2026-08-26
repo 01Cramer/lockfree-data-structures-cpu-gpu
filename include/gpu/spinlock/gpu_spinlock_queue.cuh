@@ -1,32 +1,26 @@
 #pragma once
 
-#include "gpu/shared/atomics.cuh"
-#include "gpu/shared/node_pool.cuh"
-#include "gpu/shared/spinlock.cuh"
+#include "gpu/shared/gpu_atomics.cuh"
+#include "gpu/shared/gpu_node_pool.cuh"
+#include "gpu/shared/gpu_spinlock.cuh"
 
 namespace gpu {
 
 namespace spinlock {
 
-// Variant 1: FIFO queue behind a single spinlock.
-//
-// This is Michael & Scott's *blocking* algorithm (1996, §3) in its single-lock
-// form, the same one Cederman, Chatterjee & Tsigas evaluate on a GPU in
-// Euro-Par 2012. The device port of cpu/spinlock/spinlock_queue.hpp: same
-// structure, same sentinel, only the lock and the node addressing differ.
+// FIFO queue behind a single spinlock.
+// The device port of cpu/spinlock/spinlock_queue.hpp: 
+// same structure, same sentinel, only the lock and the node addressing differ.
 //
 // A sentinel node keeps m_head and m_tail non-null, so neither enqueue nor
 // dequeue branches on emptiness and all three variants have the same shape.
 // The sentinel is pool node 0 rather than a member, because the queue itself
 // lives in device memory as a flat object with no constructor.
 //
-// Memory ordering: every access to a node's `next` happens inside the critical
+// Memory ordering: every access to a node's 'next' happens inside the critical
 // section, so the lock's acquire/release pair provides all the ordering there
-// is and the links are plain, non-atomic loads and stores. That is exactly
-// what makes this the cheapest-per-operation and least-scalable variant, and
-// it is the honest baseline for "what does the synchronization cost": nothing
-// in the data path is paying for concurrency, the lock is paying for all of
-// it.
+// is and the links are plain, non-atomic loads and stores.
+
 template <typename T> class alignas(kDeviceCacheLineBytes) Queue {
 public:
   // Called by exactly one thread before any operation. Not a constructor:
@@ -40,8 +34,7 @@ public:
   }
 
   // Returns false only when the caller's pool slice is exhausted, which is a
-  // run-invalidating error the host detects through NodePool::overflow. A
-  // false is never a legitimate "queue full": the queue is unbounded.
+  // run-invalidating error the host detects through NodePool::overflow.
   __device__ bool enqueue(const T &value, NodeAllocator<T> &allocator) {
     const NodeIndex newNode = allocator.take();
     if (newNode == kNullIndex) {
@@ -56,10 +49,7 @@ public:
     return true;
   }
 
-  // Returns false when the queue is empty. The value is written through `out`
-  // rather than returned in an optional; there is no std::optional in device
-  // code, and since no cross-platform ratio is quoted the difference in
-  // signature from the CPU side carries no comparison risk.
+  // Returns false when the queue is empty.
   __device__ bool dequeue(T &out) {
     const LockGuard guard(m_lock);
     const NodeIndex next = m_nodes[m_head].next;
@@ -72,14 +62,10 @@ public:
   }
 
 private:
-  // Read-only after initialize(), so it shares no line with anything written.
   Node<T> *m_nodes;
 
-  // One synchronization point, so head, tail and the lock word are one group
-  // on one line: they are only ever touched by the thread holding the lock,
-  // and separating them would cost that thread extra lines for no reduction in
-  // contention. See atomics.cuh on why the grouping is fixed rather than
-  // swept.
+  // Single synchronization point for the whole queue. The lock is aligned so its
+  // atomic traffic is not coupled to preceding fields by layout.
   alignas(kDeviceCacheLineBytes) Spinlock m_lock;
   NodeIndex m_head;
   NodeIndex m_tail;

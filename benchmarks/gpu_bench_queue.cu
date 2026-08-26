@@ -1,44 +1,25 @@
-// The GPU measurement harness. One CSV row per repetition on stdout, everything
-// else on stderr, so `gpu_bench_queue ... > run.csv` is directly readable.
-//
-// The whole sweep runs in one process so that it shares one CUDA context: no
-// point in the curve pays a context-creation cost its neighbours did not, and the
-// device clock stays settled across neighbouring configurations.
-//
-// Example, the primary result:
-//
-//   gpu_bench_queue --variant spinlock,spinlock_two_lock,lockfree \
-//                   --warps 1,2,4,8,16,32,64,128,256 \
-//                   --lanes 1,32 --work 0,32,256 \
-//                   --ops 1000 --prefill 1048576 --reps 5 > run.csv
-//
-// The second-order experiment. Block size is only interpretable at CONSTANT total
-// warps, since block count already controls total warps and blockDim only changes
-// how warps are packed onto SMs:
-//
-//   for d in 32 64 128; do
-//     gpu_bench_queue --variant lockfree --warps 2048 --block-dim $d ... ;
-//   done
+// GPU queue benchmark driver. CSV rows go to stdout; logs go to stderr.
+// The whole sweep runs in one process and uses one CUDA context.
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <string>
 #include <vector>
 
 #include <cuda_runtime.h>
 
-#include "gpu/lockfree/lockfree_queue.cuh"
-#include "gpu/shared/cuda_error.cuh"
-#include "gpu/spinlock/spinlock_queue.cuh"
-#include "gpu/spinlock/spinlock_queue_two_lock.cuh"
+#include "gpu/lockfree/gpu_lockfree_queue.cuh"
+#include "gpu/shared/gpu_cuda_utils.cuh"
+#include "gpu/spinlock/gpu_spinlock_queue.cuh"
+#include "gpu/spinlock/gpu_spinlock_queue_two_lock.cuh"
 #include "support/gpu_energy.cuh"
 #include "support/gpu_workload.cuh"
 
 using gpubench::Config;
 using gpubench::EnergyMeter;
 using gpubench::Key;
-using gpubench::kWarpSize;
 using gpubench::Result;
 
 namespace {
@@ -46,6 +27,41 @@ namespace {
 using SpinlockQueue = gpu::spinlock::Queue<Key>;
 using SpinlockQueueTwoLock = gpu::spinlock::QueueTwoLock<Key>;
 using LockfreeQueue = gpu::lockfree::Queue<Key>;
+
+constexpr const char *kVariants[] = {"spinlock", "spinlock_two_lock",
+                                     "lockfree"};
+constexpr int kBlocks[] = {1, 2, 4, 8, 16, 32, 64, 128};
+constexpr int kBlockDims[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
+constexpr int kMixes[] = {90, 50, 10};
+constexpr int kOpsPerThread = 1000;
+constexpr int kRepetitions = 5;
+constexpr int kNodesPerThread = 0; // 0 = derive from the operation mix
+
+constexpr int kCalibrationStartOps = 100;
+constexpr int kCalibrationMaxOps = 10000000;
+constexpr double kCalibrationTargetMs = 60.0;
+constexpr double kCalibrationMinProbeMs = 10.0;
+
+struct Metrics {
+  double milliseconds = 0.0;
+  double enqueueSuccess = 0.0;
+  double enqueueAttempts = 0.0;
+  double dequeueSuccess = 0.0;
+  double dequeueAttempts = 0.0;
+  double opsSuccess = 0.0;
+  double opsAttempts = 0.0;
+  double opsPerSecond = 0.0;
+  double dequeueFailFraction = 0.0;
+  double poolMb = 0.0;
+  double energyJoules = 0.0;
+  double energyOk = 0.0;
+  double energyWindowOk = 0.0;
+  double energyFromCounter = 0.0;
+  double powerWatts = 0.0;
+  double idleWatts = 0.0;
+  double nanoJoulesPerOp = 0.0;
+  double marginalNanoJoulesPerOp = 0.0;
+};
 
 Result dispatch(const Config &cfg, const EnergyMeter &meter) {
   if (cfg.variant == "spinlock") {
@@ -64,308 +80,265 @@ Result dispatch(const Config &cfg, const EnergyMeter &meter) {
   std::exit(2);
 }
 
-std::vector<std::string> splitList(const char *raw) {
-  std::vector<std::string> parts;
-  std::string current;
-  for (const char *p = raw; *p != '\0'; ++p) {
-    if (*p == ',') {
-      if (!current.empty()) {
-        parts.push_back(current);
-      }
-      current.clear();
-    } else {
-      current.push_back(*p);
-    }
-  }
-  if (!current.empty()) {
-    parts.push_back(current);
-  }
-  return parts;
-}
-
-std::vector<int> splitInts(const char *raw) {
-  std::vector<int> values;
-  for (const std::string &part : splitList(raw)) {
-    values.push_back(static_cast<int>(std::strtol(part.c_str(), nullptr, 10)));
-  }
-  return values;
-}
-
-struct Options {
-  std::vector<std::string> variants{"spinlock", "spinlock_two_lock",
-                                    "lockfree"};
-  // Starts at 2: the mix is carried on warp parity, so a single warp would be a
-  // producer-only run measuring a different workload.
-  std::vector<int> warps{2, 4, 8, 16, 32, 64, 128, 256};
-  std::vector<int> lanes{1, 32};
-  std::vector<int> work{0};
-  int opsPerThread = 1000; // Zhang et al.'s figure
-  int prefill = 1 << 20;
-  int reps = 5;
-  int warmup = 1;
-  int blockDim = 32;
-  int nodesPerThread = 0;
-  // Ceiling on counted operations per configuration, since the lock-based
-  // variants at 32 lanes and a high warp count can run overnight. Reported in
-  // the ops_capped column rather than applied silently: a capped point has a
-  // shorter timed window than its neighbours.
-  long long maxTotalOps = 0; // 0 = uncapped
-};
-
-void usage() {
-  std::fprintf(
-      stderr,
-      "usage: gpu_bench_queue [options]   (CSV on stdout, log on stderr)\n"
-      "  --variant LIST      spinlock,spinlock_two_lock,lockfree\n"
-      "  --warps LIST        total warps in the grid\n"
-      "  --lanes LIST        active lanes per warp, 1..32\n"
-      "  --work LIST         units of private work between operations\n"
-      "  --ops N             operations per participating thread\n"
-      "  --prefill N         items in the queue before the timed region\n"
-      "  --reps N            recorded repetitions per configuration\n"
-      "  --warmup N          discarded repetitions per configuration\n"
-      "  --block-dim N       threads per block; only interpretable at\n"
-      "                      constant total warps\n"
-      "  --nodes-per-thread N  override the pool slice size\n"
-      "  --max-total-ops N   cap counted ops per configuration (0 = off)\n"
-      "env GPU_BENCH_MAX_POOL_MB overrides the pool memory budget.\n");
-}
-
-void failUsage(const char *message) {
-  std::fprintf(stderr, "%s\n", message);
-  usage();
-  std::exit(2);
-}
-
-Options parse(int argc, char **argv) {
-  Options options;
-  for (int i = 1; i < argc; ++i) {
-    const char *flag = argv[i];
-    const bool hasValue = i + 1 < argc;
-    if (std::strcmp(flag, "--variant") == 0 && hasValue) {
-      options.variants = splitList(argv[++i]);
-    } else if (std::strcmp(flag, "--warps") == 0 && hasValue) {
-      options.warps = splitInts(argv[++i]);
-    } else if (std::strcmp(flag, "--lanes") == 0 && hasValue) {
-      options.lanes = splitInts(argv[++i]);
-    } else if (std::strcmp(flag, "--work") == 0 && hasValue) {
-      options.work = splitInts(argv[++i]);
-    } else if (std::strcmp(flag, "--ops") == 0 && hasValue) {
-      options.opsPerThread =
-          static_cast<int>(std::strtol(argv[++i], nullptr, 10));
-    } else if (std::strcmp(flag, "--prefill") == 0 && hasValue) {
-      options.prefill = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
-    } else if (std::strcmp(flag, "--reps") == 0 && hasValue) {
-      options.reps = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
-    } else if (std::strcmp(flag, "--warmup") == 0 && hasValue) {
-      options.warmup = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
-    } else if (std::strcmp(flag, "--block-dim") == 0 && hasValue) {
-      options.blockDim = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
-    } else if (std::strcmp(flag, "--nodes-per-thread") == 0 && hasValue) {
-      options.nodesPerThread =
-          static_cast<int>(std::strtol(argv[++i], nullptr, 10));
-    } else if (std::strcmp(flag, "--max-total-ops") == 0 && hasValue) {
-      options.maxTotalOps = std::strtoll(argv[++i], nullptr, 10);
-    } else {
-      usage();
-      std::exit(2);
-    }
-  }
-  return options;
-}
-
-// Independent thread scheduling is a correctness precondition for the
-// lock-based variants; below compute 7.0 they deadlock rather than run slowly.
-void requireVoltaOrNewer() {
-  int device = 0;
-  GPU_CUDA_CHECK(cudaGetDevice(&device));
-  cudaDeviceProp properties{};
-  GPU_CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
-  int clockRateKHz = 0;
-  GPU_CUDA_CHECK(
-      cudaDeviceGetAttribute(&clockRateKHz, cudaDevAttrClockRate, device));
-
-  std::fprintf(stderr,
-               "device: %s, compute %d.%d, %d SMs, %.1f GB, "
-               "L2 %d KB, clock %.0f MHz\n",
-               properties.name, properties.major, properties.minor,
-               properties.multiProcessorCount,
-               static_cast<double>(properties.totalGlobalMem) / (1 << 30),
-               properties.l2CacheSize / 1024,
-               static_cast<double>(clockRateKHz) / 1000.0);
-
-  if (properties.major < 7) {
-    std::fprintf(stderr,
-                 "compute %d.%d is below the 7.0 floor this project requires "
-                 "(independent thread scheduling). The lock-based variants "
-                 "would deadlock at activeLanes > 1.\n",
-                 properties.major, properties.minor);
-    std::exit(1);
-  }
-}
-
 void emitHeader() {
-  std::printf("variant,warps,block_dim,threads,active_lanes,"
-              "participating_threads,ops_per_thread,ops_capped,inter_op_work,"
-              "prefill,rep,ms,enq_success,enq_attempts,deq_success,"
+  std::printf("variant,blocks,block_dim,threads,participating_threads,"
+              "ops_per_thread,mix_pct,"
+              "prefill,stat,rep,ms,enq_success,enq_attempts,deq_success,"
               "deq_attempts,ops_success,ops_attempts,ops_per_sec,"
               "deq_fail_frac,pool_mb,"
               "energy_j,energy_ok,energy_window_ok,energy_from_counter,"
               "power_w,idle_power_w,nj_per_op,marginal_nj_per_op\n");
 }
 
-void emitRow(const Config &cfg, int rep, const Result &result,
-             const EnergyMeter &meter) {
-  int producers = 0;
-  int consumers = 0;
-  gpubench::participants(cfg, producers, consumers);
+void emitCalibrationHeader() {
+  std::printf("variant,blocks,block_dim,threads,mix_pct,probe_ops_per_thread,"
+              "ms,energy_window_ok,ops_per_sec,pool_mb,"
+              "recommended_ops_per_thread\n");
+}
 
+Metrics makeMetrics(const Result &result, const EnergyMeter &meter) {
   const long long success = result.enqueueSuccess + result.dequeueSuccess;
   const long long attempts = result.enqueueAttempts + result.dequeueAttempts;
   const double seconds = result.milliseconds / 1000.0;
 
-  // Successful operations only: a failed dequeue is much cheaper than a real one
-  // and its cost differs by variant, so counting it would inflate whichever
-  // variant detects emptiness fastest.
-  const double opsPerSecond = seconds > 0.0
-                                  ? static_cast<double>(success) / seconds
-                                  : 0.0;
-  // If this is not near zero, the queue ran dry and the run partly measured
-  // failure detection.
-  const double dequeueFailFraction =
+  Metrics m;
+  m.milliseconds = result.milliseconds;
+  m.enqueueSuccess = static_cast<double>(result.enqueueSuccess);
+  m.enqueueAttempts = static_cast<double>(result.enqueueAttempts);
+  m.dequeueSuccess = static_cast<double>(result.dequeueSuccess);
+  m.dequeueAttempts = static_cast<double>(result.dequeueAttempts);
+  m.opsSuccess = static_cast<double>(success);
+  m.opsAttempts = static_cast<double>(attempts);
+  m.opsPerSecond =
+      seconds > 0.0 ? static_cast<double>(success) / seconds : 0.0;
+  m.dequeueFailFraction =
       result.dequeueAttempts > 0
           ? 1.0 - static_cast<double>(result.dequeueSuccess) /
                       static_cast<double>(result.dequeueAttempts)
           : 0.0;
+  m.poolMb = static_cast<double>(result.poolBytes) / (1024.0 * 1024.0);
 
-  // Energy per successful operation, total and with the board's idle draw
-  // removed. The marginal figure is the one to reason from: an idle GPU draws a
-  // large fraction of its loaded power, so total energy divided by operations
-  // is close to a restatement of throughput -- which is exactly what the CPU
-  // half of this study measured, at a correlation of 0.992.
-  const double nanoJoulesPerOp =
+  m.energyJoules = result.energy.joules;
+  m.energyOk = result.energy.valid ? 1.0 : 0.0;
+  m.energyWindowOk = result.energyWindowOk ? 1.0 : 0.0;
+  m.energyFromCounter = result.energy.fromCounter ? 1.0 : 0.0;
+  m.powerWatts = result.energy.watts;
+  m.idleWatts = meter.idleWatts();
+  m.nanoJoulesPerOp =
       (result.energy.valid && success > 0)
           ? result.energy.joules * 1e9 / static_cast<double>(success)
           : 0.0;
   const double marginalJoules =
       result.energy.joules - meter.idleWatts() * seconds;
-  const double marginalNanoJoulesPerOp =
+  m.marginalNanoJoulesPerOp =
       (result.energy.valid && success > 0 && marginalJoules > 0.0)
           ? marginalJoules * 1e9 / static_cast<double>(success)
           : 0.0;
+  return m;
+}
 
-  std::printf("%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.6f,%lld,%lld,%lld,%lld,"
-              "%lld,%lld,%.3f,%.6f,%.2f,"
-              "%.6f,%d,%d,%d,%.3f,%.3f,%.3f,%.3f\n",
-              cfg.variant.c_str(), cfg.warps, cfg.blockDim,
-              gpubench::totalThreads(cfg), cfg.activeLanes,
-              producers + consumers, cfg.opsPerThread, cfg.capped ? 1 : 0,
-              cfg.interOpWork, cfg.prefill, rep, result.milliseconds,
-              result.enqueueSuccess, result.enqueueAttempts,
-              result.dequeueSuccess, result.dequeueAttempts, success, attempts,
-              opsPerSecond, dequeueFailFraction,
-              static_cast<double>(result.poolBytes) / (1024.0 * 1024.0),
-              result.energy.joules, result.energy.valid ? 1 : 0,
-              result.energyWindowOk ? 1 : 0,
-              result.energy.fromCounter ? 1 : 0, result.energy.watts,
-              meter.idleWatts(), nanoJoulesPerOp, marginalNanoJoulesPerOp);
+void emitRow(const Config &cfg, const char *stat, int rep, const Metrics &m) {
+  std::printf("%s,%d,%d,%d,%lld,%d,%d,%lld,%s,%d,"
+              "%.6f,%.0f,%.0f,%.0f,%.0f,"
+              "%.0f,%.0f,%.3f,%.6f,%.2f,"
+              "%.6f,%.0f,%.0f,%.0f,%.3f,%.3f,%.3f,%.3f\n",
+              cfg.variant.c_str(), cfg.blocks, cfg.blockDim,
+              static_cast<int>(gpubench::totalThreads(cfg)),
+              gpubench::totalThreads(cfg), cfg.opsPerThread, cfg.mixPct,
+              gpubench::prefillFor(cfg), stat, rep,
+              m.milliseconds, m.enqueueSuccess, m.enqueueAttempts,
+              m.dequeueSuccess, m.dequeueAttempts, m.opsSuccess, m.opsAttempts,
+              m.opsPerSecond, m.dequeueFailFraction, m.poolMb, m.energyJoules,
+              m.energyOk, m.energyWindowOk, m.energyFromCounter, m.powerWatts,
+              m.idleWatts, m.nanoJoulesPerOp, m.marginalNanoJoulesPerOp);
   std::fflush(stdout);
+}
+
+int recommendedOpsPerThread(int probeOps, double milliseconds) {
+  if (milliseconds <= 0.0) {
+    return kCalibrationMaxOps;
+  }
+  const double scaled =
+      std::ceil(static_cast<double>(probeOps) * kCalibrationTargetMs /
+                milliseconds);
+  if (scaled < 1.0) {
+    return 1;
+  }
+  if (scaled > static_cast<double>(kCalibrationMaxOps)) {
+    return kCalibrationMaxOps;
+  }
+  return static_cast<int>(scaled);
+}
+
+int nextCalibrationOps(int probeOps, double milliseconds) {
+  const int recommended = recommendedOpsPerThread(probeOps, milliseconds);
+  if (milliseconds >= kCalibrationMinProbeMs || probeOps >= recommended) {
+    return probeOps;
+  }
+  const int doubled = probeOps * 2;
+  return std::min(kCalibrationMaxOps, std::max(doubled, recommended));
+}
+
+void emitCalibrationRow(const Config &cfg, const Metrics &m,
+                        int recommendedOps) {
+  std::printf("%s,%d,%d,%lld,%d,%d,%.6f,%.0f,%.3f,%.2f,%d\n",
+              cfg.variant.c_str(), cfg.blocks, cfg.blockDim,
+              gpubench::totalThreads(cfg), cfg.mixPct, cfg.opsPerThread,
+              m.milliseconds, m.energyWindowOk, m.opsPerSecond, m.poolMb,
+              recommendedOps);
+  std::fflush(stdout);
+}
+
+double median(std::vector<double> values) {
+  std::sort(values.begin(), values.end());
+  const std::size_t middle = values.size() / 2;
+  if ((values.size() % 2) == 1) {
+    return values[middle];
+  }
+  return (values[middle - 1] + values[middle]) / 2.0;
+}
+
+double meanOf(const std::vector<Metrics> &rows, double Metrics::*field) {
+  double sum = 0.0;
+  for (const Metrics &row : rows) {
+    sum += row.*field;
+  }
+  return sum / static_cast<double>(rows.size());
+}
+
+double medianOf(const std::vector<Metrics> &rows, double Metrics::*field) {
+  std::vector<double> values;
+  values.reserve(rows.size());
+  for (const Metrics &row : rows) {
+    values.push_back(row.*field);
+  }
+  return median(values);
+}
+
+void setAggregate(double &target, const std::vector<Metrics> &rows,
+                  double Metrics::*field, bool useMedian) {
+  target = useMedian ? medianOf(rows, field) : meanOf(rows, field);
+}
+
+Metrics aggregateMetrics(const std::vector<Metrics> &rows, bool useMedian) {
+  Metrics out;
+  setAggregate(out.milliseconds, rows, &Metrics::milliseconds, useMedian);
+  setAggregate(out.enqueueSuccess, rows, &Metrics::enqueueSuccess, useMedian);
+  setAggregate(out.enqueueAttempts, rows, &Metrics::enqueueAttempts, useMedian);
+  setAggregate(out.dequeueSuccess, rows, &Metrics::dequeueSuccess, useMedian);
+  setAggregate(out.dequeueAttempts, rows, &Metrics::dequeueAttempts, useMedian);
+  setAggregate(out.opsSuccess, rows, &Metrics::opsSuccess, useMedian);
+  setAggregate(out.opsAttempts, rows, &Metrics::opsAttempts, useMedian);
+  setAggregate(out.opsPerSecond, rows, &Metrics::opsPerSecond, useMedian);
+  setAggregate(out.dequeueFailFraction, rows, &Metrics::dequeueFailFraction,
+               useMedian);
+  setAggregate(out.poolMb, rows, &Metrics::poolMb, useMedian);
+  setAggregate(out.energyJoules, rows, &Metrics::energyJoules, useMedian);
+  setAggregate(out.energyOk, rows, &Metrics::energyOk, useMedian);
+  setAggregate(out.energyWindowOk, rows, &Metrics::energyWindowOk, useMedian);
+  setAggregate(out.energyFromCounter, rows, &Metrics::energyFromCounter,
+               useMedian);
+  setAggregate(out.powerWatts, rows, &Metrics::powerWatts, useMedian);
+  setAggregate(out.idleWatts, rows, &Metrics::idleWatts, useMedian);
+  setAggregate(out.nanoJoulesPerOp, rows, &Metrics::nanoJoulesPerOp,
+               useMedian);
+  setAggregate(out.marginalNanoJoulesPerOp, rows,
+               &Metrics::marginalNanoJoulesPerOp, useMedian);
+  return out;
+}
+
+bool calibrationModeEnabled() {
+  const char *raw = std::getenv("GPU_BENCH_CALIBRATE");
+  return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+}
+
+void runCalibration(const EnergyMeter &meter) {
+  emitCalibrationHeader();
+
+  int globalRecommended = 1;
+  for (const char *variant : kVariants) {
+    for (int mix : kMixes) {
+      for (int blocks : kBlocks) {
+        for (int blockDim : kBlockDims) {
+          Config cfg;
+          cfg.variant = variant;
+          cfg.blocks = blocks;
+          cfg.blockDim = blockDim;
+          cfg.mixPct = mix;
+          cfg.nodesPerThread = kNodesPerThread;
+
+          int probeOps = kCalibrationStartOps;
+          while (true) {
+            cfg.opsPerThread = probeOps;
+            const Metrics metrics = makeMetrics(dispatch(cfg, meter), meter);
+            const int recommended =
+                recommendedOpsPerThread(probeOps, metrics.milliseconds);
+            emitCalibrationRow(cfg, metrics, recommended);
+            globalRecommended = std::max(globalRecommended, recommended);
+
+            const int nextProbe =
+                nextCalibrationOps(probeOps, metrics.milliseconds);
+            if (nextProbe == probeOps || metrics.milliseconds >=
+                                            kCalibrationMinProbeMs) {
+              break;
+            }
+            probeOps = nextProbe;
+          }
+
+          std::fprintf(stderr,
+                       "calibrated %s blocks=%d block_dim=%d mix=%d\n",
+                       variant, blocks, blockDim, mix);
+        }
+      }
+    }
+  }
+
+  std::fprintf(stderr,
+               "calibration max recommended ops_per_thread for %.0f ms: %d\n",
+               kCalibrationTargetMs, globalRecommended);
 }
 
 } // namespace
 
-int main(int argc, char **argv) {
-  const Options options = parse(argc, argv);
-  requireVoltaOrNewer();
+int main() {
+  gpu::requireVoltaOrNewer(stderr, true);
 
-  // One meter for the whole sweep: NVML initialisation is not free, and the
-  // idle baseline is a property of the device rather than of a configuration.
+  // One meter and one idle baseline for the whole sweep.
   const EnergyMeter meter;
   std::fprintf(stderr, "energy: %s\n", meter.status());
 
-  if (options.variants.empty() || options.warps.empty() ||
-      options.lanes.empty() || options.work.empty()) {
-    failUsage("list-valued options must not be empty");
+  if (calibrationModeEnabled()) {
+    runCalibration(meter);
+    return 0;
   }
-  if (options.opsPerThread <= 0) {
-    failUsage("--ops must be positive");
-  }
-  if (options.prefill < 0) {
-    failUsage("--prefill must be non-negative");
-  }
-  if (options.reps < 0 || options.warmup < 0) {
-    failUsage("--reps and --warmup must be non-negative");
-  }
-  if (options.nodesPerThread < 0) {
-    failUsage("--nodes-per-thread must be non-negative");
-  }
-  if (options.maxTotalOps < 0) {
-    failUsage("--max-total-ops must be non-negative");
-  }
-  if (options.blockDim % kWarpSize != 0 || options.blockDim <= 0) {
-    failUsage("--block-dim must be a positive multiple of 32");
-  }
-  for (int lanes : options.lanes) {
-    if (lanes < 1 || lanes > kWarpSize) {
-      failUsage("--lanes values must be in the range 1..32");
-    }
-  }
-  for (int warps : options.warps) {
-    if (warps <= 0) {
-      failUsage("--warps values must be positive");
-    }
-  }
+
   emitHeader();
 
-  for (const std::string &variant : options.variants) {
-    for (int work : options.work) {
-      for (int lanes : options.lanes) {
-        for (int warps : options.warps) {
+  for (const char *variant : kVariants) {
+    for (int mix : kMixes) {
+      for (int blocks : kBlocks) {
+        for (int blockDim : kBlockDims) {
           Config cfg;
           cfg.variant = variant;
-          cfg.warps = warps;
-          cfg.blockDim = options.blockDim;
-          cfg.activeLanes = lanes;
-          cfg.opsPerThread = options.opsPerThread;
-          cfg.interOpWork = work;
-          cfg.prefill = options.prefill;
-          cfg.nodesPerThread = options.nodesPerThread;
+          cfg.blocks = blocks;
+          cfg.blockDim = blockDim;
+          cfg.opsPerThread = kOpsPerThread;
+          cfg.mixPct = mix;
+          cfg.nodesPerThread = kNodesPerThread;
 
-          if (warps * kWarpSize % options.blockDim != 0) {
-            std::fprintf(stderr,
-                         "skipping warps=%d: %d threads is not a whole number "
-                         "of blocks at blockDim %d\n",
-                         warps, warps * kWarpSize, options.blockDim);
-            continue;
+          std::vector<Metrics> rows;
+          rows.reserve(kRepetitions);
+          for (int rep = 0; rep < kRepetitions; ++rep) {
+            Metrics metrics = makeMetrics(dispatch(cfg, meter), meter);
+            rows.push_back(metrics);
+            emitRow(cfg, "rep", rep, metrics);
           }
-          if (warps < 2) {
-            std::fprintf(stderr,
-                         "skipping warps=1: the 50/50 mix needs at least one "
-                         "producer warp and one consumer warp\n");
-            continue;
-          }
+          emitRow(cfg, "mean", -1, aggregateMetrics(rows, false));
+          emitRow(cfg, "median", -1, aggregateMetrics(rows, true));
 
-          int producers = 0;
-          int consumers = 0;
-          gpubench::participants(cfg, producers, consumers);
-          const long long participating = producers + consumers;
-          if (options.maxTotalOps > 0 &&
-              participating * cfg.opsPerThread > options.maxTotalOps) {
-            const long long capped = options.maxTotalOps / participating;
-            cfg.opsPerThread = static_cast<int>(capped > 0 ? capped : 1);
-            cfg.capped = true;
-          }
-
-          for (int rep = 0; rep < options.warmup; ++rep) {
-            (void)dispatch(cfg, meter);
-          }
-          for (int rep = 0; rep < options.reps; ++rep) {
-            emitRow(cfg, rep, dispatch(cfg, meter), meter);
-          }
-
-          std::fprintf(stderr, "done %s warps=%d lanes=%d work=%d ops=%d%s\n",
-                       variant.c_str(), warps, lanes, work, cfg.opsPerThread,
-                       cfg.capped ? " (capped)" : "");
+          std::fprintf(stderr,
+                       "done %s blocks=%d block_dim=%d mix=%d ops=%d\n",
+                       variant, blocks, blockDim, mix, cfg.opsPerThread);
         }
       }
     }
